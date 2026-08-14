@@ -22,7 +22,7 @@ except ImportError:
     HAS_LUAPARSER = False
 
 MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate v7"
+ATTRIBUTION = "-- obfuscated by buterfuscate v8"
 
 # ── Tokeniser ──────────────────────────────────────────────────────────────
 _TOKEN_RE = re.compile(
@@ -127,558 +127,166 @@ def _mask_num(val: str) -> str:
     if n>9_999_999: return val
     return _mba(n)
 
-def _encrypt(val: str) -> dict | None:
-    plain=_literal_bytes(val)
-    if plain is None: return None
-    n=len(plain)
-    if n==0:
-        return {"a":[],"b":[],"c":[],"seed":0,"add":0,"step":0,
-                "blk":0,"rot":0,"rev":0,"n":0,"chk":2166136261}
-    seed=secrets.randbelow(251)+1; add=secrets.randbelow(251)
-    step=secrets.randbelow(31)+1;  blk=secrets.randbelow(251)+1
-    rot=secrets.randbelow(7)+1;    rev=secrets.randbelow(2)
-    s1=[b^((seed+i*step+add)%256) for i,b in enumerate(plain)]
-    s2=[((b<<rot)|(b>>(8-rot)))&0xFF for b in s1]
-    s3=[b^blk for b in s2]
-    if rev: s3=s3[::-1]
-    chk=2166136261
-    for b in plain: chk=((chk^b)*16777619)&0xFFFFFFFF
-    return {"a":s3[0::3],"b":s3[1::3],"c":s3[2::3],
-            "seed":seed,"add":add,"step":step,"blk":blk,
-            "rot":rot,"rev":rev,"n":n,"chk":chk}
+def _pack_meta(split_count: int, seed: int, add: int, step: int, blk: int, rot: int, rev: int) -> int:
+    return (split_count & 0xF) | ((seed & 0xFF) << 4) | ((add & 0xFF) << 12) | ((step & 0x1F) << 20) | ((blk & 0xFF) << 25) | ((rot & 0x7) << 33) | ((rev & 0x1) << 36)
 
-OP_LOAD=0; OP_JUNK=1; _REAL_OPS=2
+def _encrypt_variable(val: str) -> dict | None:
+    plain = _literal_bytes(val)
+    if plain is None:
+        return None
+    n = len(plain)
+    if n == 0:
+        return {"chunks": [[]], "meta": 0, "chk": 2166136261}
+    split_count = secrets.randbelow(4) + 2  # 2-5
+    seed = secrets.randbelow(251) + 1
+    add = secrets.randbelow(251)
+    step = secrets.randbelow(31) + 1
+    blk = secrets.randbelow(251) + 1
+    rot = secrets.randbelow(7) + 1
+    rev = secrets.randbelow(2)
+    # apply transforms
+    s1 = [b ^ ((seed + i * step + add) % 256) for i, b in enumerate(plain)]
+    s2 = [((b << rot) | (b >> (8 - rot))) & 0xFF for b in s1]
+    s3 = [b ^ blk for b in s2]
+    if rev:
+        s3 = s3[::-1]
+    chunks = [[] for _ in range(split_count)]
+    for i, b in enumerate(s3):
+        chunks[i % split_count].append(b)
+    chk = 2166136261
+    for b in plain:
+        chk = ((chk ^ b) * 16777619) & 0xFFFFFFFF
+    meta = _pack_meta(split_count, seed, add, step, blk, rot, rev)
+    return {"chunks": chunks, "meta": meta, "chk": chk}
 
-def _pack(op:int, operand:int, remap:list[int]) -> int:
-    return (remap[op]&0xF)|((secrets.randbelow(4)&0x3)<<4)|((operand&0xFFFF)<<6)
-
-def _sep(a:str,b:str)->bool:
-    if not a or not b: return False
-    if (a[-1].isalnum() or a[-1]=="_") and (b[0].isalnum() or b[0]=="_"): return True
-    return a.endswith("-") and b.startswith("-")
-
-def _compact(tokens:list[str])->str:
-    out=[]
+def _compact(tokens: list[str]) -> str:
+    out = []
     for t in tokens:
-        if out and _sep(out[-1],t): out.append(" ")
+        if out and _sep(out[-1], t):
+            out.append(" ")
         out.append(t)
     return "".join(out)
 
-def _rename_locals(parsed: list[tuple[str,str]], used: set[str]) -> list[tuple[str,str]]:
-    sig = [(i,k,v) for i,(k,v) in enumerate(parsed)
-           if k not in {"whitespace","comment","long_comment"}]
-    decls: set[str] = set(); depth = 0
-    for idx,(_,kind,val) in enumerate(sig):
-        if val=="local" and depth==0:
-            nxt = idx+1
-            if nxt<len(sig) and sig[nxt][2]=="function":
-                nxt+=1
-                if nxt<len(sig) and sig[nxt][1]=="identifier": decls.add(sig[nxt][2])
-            else:
-                expect=True
-                while nxt<len(sig):
-                    _,nk,nv=sig[nxt]
-                    if nv in {"=",";"}: break
-                    if expect and nk=="identifier": decls.add(nv); expect=False
-                    elif nv==",": expect=True
-                    nxt+=1
-        if val in {"function","do","then","repeat"}: depth+=1
-        elif val in {"end","until"}: depth=max(0,depth-1)
-    if not decls: return parsed
-    rmap={n:_fresh(used,confuse=True) for n in sorted(decls)}
-    prev_s=[]; prev=""
-    for k,v in parsed:
-        prev_s.append(prev)
-        if k not in {"whitespace","comment","long_comment"}: prev=v
-    nxt_s=[""]*len(parsed); fol=""
-    for i in range(len(parsed)-1,-1,-1):
-        nxt_s[i]=fol
-        k,v=parsed[i]
-        if k not in {"whitespace","comment","long_comment"}: fol=v
-    out=[]; bd=0
-    for i,(kind,val) in enumerate(parsed):
-        if kind=="symbol":
-            if val=="{": bd+=1
-            elif val=="}": bd=max(0,bd-1)
-        if kind!="identifier" or val not in rmap:
-            out.append((kind,val)); continue
-        is_field=(prev_s[i] in {".",":" } or (bd>0 and nxt_s[i]=="="))
-        out.append((kind, val if is_field else rmap[val]))
-    return out
+def _sep(a: str, b: str) -> bool:
+    if not a or not b:
+        return False
+    if (a[-1].isalnum() or a[-1] == "_") and (b[0].isalnum() or b[0] == "_"):
+        return True
+    return a.endswith("-") and b.startswith("-")
 
-def _output_name(filename: str) -> str:
-    stem=re.sub(r"[^A-Za-z0-9_.-]+","_",Path(filename).stem).strip("._")
-    return f"{stem or 'script'}.obfuscated.txt"
-
-# ── StringEncrypter (AST‑based) ──────────────────────────────────────────────
-class StringEncrypter:
-    def __init__(self, source: str, str_key: int):
-        self.source = source
-        self.str_key = str_key
-        self.b32_decryptor = (
-            'local function a(b,c)local d={}for e=1,#b,c do table.insert(d,b:sub(e,e+c-1))end;return d end;'
-            'local function f(g)local d=""repeat local h=g/2;local i,j=math.modf(h)g=i;d=math.ceil(j)..d until g==0;return d end;'
-            'local k="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"'
-            'local function Base32(b)local m=b:gsub(".",function(n)if n=="="then return""end;local o=string.find(k,n)o=o-1;return string.format("%05u",f(o))end)'
-            'local p=a(m,8)local q={}for r,s in pairs(p)do table.insert(q,string.char(tonumber(s,2)))end;'
-            'local t=table.concat(q)local u={}for e=1,#t,1 do local s=string.byte(t,e)table.insert(u,e,s)end;'
-            'local v=""for e=1,#u-1,1 do local s=u[e]local w=DecryptSTR(s)v=v..string.char(w)end;return v end\n'
-        )
-        self.str_decryptor = (
-            "local function DecryptSTR(b)local c,d=1,0;local e={};while b>0 and e>0 do local f,g=b%2,e%2;"
-            "if f~=g then d=d+c end;b=(b-f)/2;e=(e-g)/2;c=c*2 end;"
-            "if b<e then b=e end;while b>0 do local f=b%2;if f>0 then d=d+c end;b=(b-f)/2;c=c*2 end; return d end;\n"
-            + self.b32_decryptor
-        )
-
-    @staticmethod
-    def random_string(length: int) -> str:
-        return ''.join(random.choice('qwertyuioplkjhgfdsazxcvbnmQWERTYUIOPLKJHGFDSAZXCVBNM') for _ in range(length))
-
-    @staticmethod
-    def encrypt(plaintext: str, key: int) -> str:
-        pt_bytes = [ord(c) for c in plaintext.encode('utf-8')]
-        for i in range(len(pt_bytes)):
-            pt_bytes[i] ^= key
-        return base64.b32encode(bytes(pt_bytes)).decode('utf-8')
-
-    def apply(self) -> tuple[str, str]:
-        if not HAS_LUAPARSER:
-            return self.source, self.str_decryptor
-        parser = Parser(self.source)
-        tree = parser.parse()
-        string_nodes = []
-        class StringVisitor(ast.ASTVisitor):
-            def visit_String(self, node):
-                string_nodes.append(node)
-        StringVisitor().visit(tree)
-        local_names = []
-        local_table = []
-        replace_map = {}
-        for node in string_nodes:
-            if len(local_names) >= 100:
-                break
-            try:
-                s = node.s
-                if len(s) < 2:
-                    continue
-                rname = self.random_string(7)
-                local_names.append(rname)
-                encrypted = self.encrypt(s, self.str_key)
-                local_table.append(f"local {rname} = Base32(\"{encrypted}\")\n")
-                replace_map[s] = rname
-            except:
-                pass
-        new_source = self.source
-        for s, rname in replace_map.items():
-            new_source = new_source.replace(f'"{s}"', f'({rname})')
-            new_source = new_source.replace(f"'{s}'", f'({rname})')
-        code = "".join(local_table) + new_source
-        return code, self.str_decryptor
-
-# ── MathEncrypter ─────────────────────────────────────────────────────────────
-class MathEncrypter:
-    def __init__(self, source: str, int_key: int):
-        self.source = source
-        self.int_key = int_key
-        self.decrypt = f"local function DecryptINT(b)local c,d=1,0;local e={{}};while b>0 and e>0 do local f,g=b%2,e%2;if f~=g then d=d+c end;b=(b-f)/2;e=(e-g)/2;c=c*2 end;if b<e then b=e end;while b>0 do local f=b%2;if f>0 then d=d+c end;b=(b-f)/2;c=c*2 end; return d end\n"
-
-    def apply(self) -> tuple[str, str]:
-        if not HAS_LUAPARSER:
-            return self.source, self.decrypt
-        tokens = list(_tokens(self.source))
-        new_tokens = []
-        for kind, val in tokens:
-            if kind == "number" and re.fullmatch(r"\d+", val) and int(val) < 2**31:
-                val_int = int(val)
-                xor_val = val_int ^ self.int_key
-                new_tokens.append(("identifier", "DecryptINT"))
-                new_tokens.append(("symbol", "("))
-                new_tokens.append(("number", str(xor_val)))
-                new_tokens.append(("symbol", ")"))
-            else:
-                new_tokens.append((kind, val))
-        new_source = _compact([v for k, v in new_tokens])
-        return new_source, self.decrypt
-
-# ── VariableRenamer (safe, token‑based) ──────────────────────────────────────
-BUILTINS = [
-    "assert", "collectgarbage", "dofile", "error", "ipairs", "next",
-    "pairs", "pcall", "print", "rawequal", "rawget", "rawlen", "rawset",
-    "select", "tonumber", "tostring", "type", "unpack", "xpcall",
-    "math.abs", "math.acos", "math.asin", "math.atan", "math.ceil",
-    "math.cos", "math.deg", "math.exp", "math.floor", "math.fmod",
-    "math.huge", "math.log", "math.max", "math.min", "math.modf",
-    "math.pi", "math.pow", "math.rad", "math.random", "math.randomseed",
-    "math.sin", "math.sqrt", "math.tan",
-    "string.byte", "string.char", "string.dump", "string.find",
-    "string.format", "string.gmatch", "string.gsub", "string.len",
-    "string.lower", "string.match", "string.rep", "string.reverse",
-    "string.sub", "string.upper",
-    "table.concat", "table.insert", "table.remove", "table.sort",
-    "table.pack", "table.unpack",
-    "os.clock", "os.date", "os.difftime", "os.execute", "os.exit",
-    "os.getenv", "os.remove", "os.rename", "os.setlocale", "os.time",
-    "os.tmpname",
-]
-
-def _rename_variables(code: str, target: str = "luau") -> str:
-    # Step 1: rename locals using existing robust function
-    used = set()
-    tokens = list(_tokens(code))
-    tokens_renamed = _rename_locals(tokens, used)
-    code_renamed = _compact([v for k, v in tokens_renamed])
-
-    # Step 2: find builtins used as non‑field identifiers
-    builtin_simple_names = {b.split(".")[-1] for b in BUILTINS}
-    if target == "luau":
-        builtin_simple_names.discard("type")
-        builtin_simple_names.discard("dump")
-
-    # Compute context for tokens_renamed (field detection)
-    prev_s = [""] * len(tokens_renamed)
-    prev = ""
-    for i, (kind, val) in enumerate(tokens_renamed):
-        prev_s[i] = prev
-        if kind not in {"whitespace","comment","long_comment"}:
-            prev = val
-    nxt_s = [""] * len(tokens_renamed)
-    fol = ""
-    for i in range(len(tokens_renamed)-1, -1, -1):
-        nxt_s[i] = fol
-        kind, val = tokens_renamed[i]
-        if kind not in {"whitespace","comment","long_comment"}:
-            fol = val
-    bd = 0
-    builtin_used = set()
-    for i, (kind, val) in enumerate(tokens_renamed):
-        if kind == "symbol":
-            if val == "{":
-                bd += 1
-            elif val == "}":
-                bd = max(0, bd-1)
-        if kind == "identifier":
-            is_field = (prev_s[i] in {".", ":"}) or (bd > 0 and nxt_s[i] == "=")
-            if not is_field and val in builtin_simple_names:
-                builtin_used.add(val)
-
-    if not builtin_used:
-        return code_renamed
-
-    # Step 3: generate aliases
-    used_names = set(used)
-    builtin_alias = {}
-    for name in builtin_used:
-        new_name = _fresh(used_names, confuse=True)
-        builtin_alias[name] = new_name
-
-    # Step 4: replace builtin identifiers in tokens_renamed
-    output_tokens = []
-    for i, (kind, val) in enumerate(tokens_renamed):
-        if kind == "identifier":
-            is_field = (prev_s[i] in {".", ":"}) or (bd > 0 and nxt_s[i] == "=")
-            if not is_field and val in builtin_alias:
-                output_tokens.append(("identifier", builtin_alias[val]))
-                continue
-        output_tokens.append((kind, val))
-    final_code = _compact([v for k, v in output_tokens])
-
-    # Step 5: prepend local declarations
-    decl_parts = []
-    assign_parts = []
-    for alias, original in builtin_alias.items():
-        decl_parts.append(alias)
-        assign_parts.append(f"{alias}={original}")
-    declaration = "local " + ",".join(decl_parts) + "\n" + ";".join(assign_parts) + ";\n"
-    final_code = declaration + final_code
-
-    return final_code
-
-# ── Minify ────────────────────────────────────────────────────────────────────
-def _minify(code: str) -> str:
-    """Remove all unnecessary whitespace and comments, produce a single line."""
-    toks = list(_tokens(code))
-    # strip whitespace and comment tokens
-    filtered = [(k, v) for k, v in toks if k not in ("whitespace", "comment", "long_comment")]
-    # use _compact to add spaces only where needed
-    return _compact([v for k, v in filtered])
-
-# ── Main obfuscation ──────────────────────────────────────────────────────────
-def obfuscate_luau(source: str) -> str:
-    # Step 1: Variable Renamer (locals and builtins)
-    source = _rename_variables(source, target="luau")
-
-    # Step 2: String and Number encryption
-    str_key = secrets.randbelow(256) + 1
-    int_key = secrets.randbelow(256) + 1
-    str_enc = StringEncrypter(source, str_key)
-    source, str_decryptor = str_enc.apply()
-    math_enc = MathEncrypter(source, int_key)
-    source, int_decryptor = math_enc.apply()
-    decryptor_code = str_decryptor + "\n" + int_decryptor
-
-    # Step 3: Build global map for hiding function calls
-    used: Set[str] = {v for k, v in _tokens(source) if k == "identifier"}
-    parsed = _rename_locals(list(_tokens(source)), used)
-    # Recompute locals after rename
-    local_names = set()
-    sig = [(i, k, v) for i, (k, v) in enumerate(parsed) if k not in ("whitespace", "comment", "long_comment")]
+def _rename_locals(parsed: list[tuple[str, str]], used: set[str]) -> list[tuple[str, str]]:
+    sig = [(i, k, v) for i, (k, v) in enumerate(parsed)
+           if k not in {"whitespace", "comment", "long_comment"}]
+    decls: set[str] = set()
     depth = 0
-    for i, (_, kind, val) in enumerate(sig):
+    for idx, (_, kind, val) in enumerate(sig):
         if val == "local" and depth == 0:
-            nxt = i + 1
+            nxt = idx + 1
             if nxt < len(sig) and sig[nxt][2] == "function":
                 nxt += 1
                 if nxt < len(sig) and sig[nxt][1] == "identifier":
-                    local_names.add(sig[nxt][2])
+                    decls.add(sig[nxt][2])
             else:
                 expect = True
                 while nxt < len(sig):
                     _, nk, nv = sig[nxt]
-                    if nv in ("=", ";"):
+                    if nv in {"=", ";"}:
                         break
                     if expect and nk == "identifier":
-                        local_names.add(nv)
+                        decls.add(nv)
                         expect = False
                     elif nv == ",":
                         expect = True
                     nxt += 1
-        if val in ("function", "do", "then", "repeat"):
+        if val in {"function", "do", "then", "repeat"}:
             depth += 1
-        elif val in ("end", "until"):
+        elif val in {"end", "until"}:
             depth = max(0, depth - 1)
-
-    global_map = {}
-    i = 0
-    while i < len(parsed):
-        kind, val = parsed[i]
-        if kind == "identifier" and val not in local_names:
-            j = i + 1
-            while j < len(parsed) and parsed[j][0] in ("whitespace", "comment", "long_comment"):
-                j += 1
-            if j < len(parsed) and parsed[j][1] == "(":
-                if i > 0 and parsed[i-1][1] not in (".", ":"):
-                    global_map[val] = secrets.randbelow(0xFFFF) + 1
-        i += 1
-
-    # Generate unique name for lookup table
-    lookup_name = _fresh(used)
-
-    # Replace globals with lookup_name
-    parsed = _replace_globals(parsed, local_names, global_map, lookup_name)
-
-    # Process strings and numbers for the VM
-    records = []
-    out_tok = []
-    for kind, val in parsed:
-        if kind in ("comment", "long_comment"):
-            continue
-        if kind == "whitespace":
-            continue
-        if kind in ("string", "long_string"):
-            rec = _encrypt(val)
-            if rec is None:
-                out_tok.append(val)
-            else:
-                records.append(rec)
-                out_tok.append(f"__R{len(records)-1}__")
-            continue
-        if kind == "number":
-            out_tok.append(_mask_num(val))
-            continue
-        out_tok.append(val)
-
-    pool_ord = list(range(len(records)))
-    secrets.SystemRandom().shuffle(pool_ord)
-    o2n = {old: new for new, old in enumerate(pool_ord)}
-    srecs = [records[o] for o in pool_ord]
-
-    slots = list(range(16))
-    secrets.SystemRandom().shuffle(slots)
-    remap = slots[:2]
-    stream = []
-    for old_idx in range(len(records)):
-        for _ in range(secrets.randbelow(3)):
-            stream.append(_pack(1, secrets.randbelow(0xFFFF), remap))
-        stream.append(_pack(0, o2n[old_idx], remap))
-    for _ in range(secrets.randbelow(4)):
-        stream.append(_pack(1, secrets.randbelow(0xFFFF), remap))
-
-    stream_chk = 0
-    for p in stream:
-        stream_chk ^= p
-    stream_chk &= 0xFFFFFFFF
-
-    guard = 0
-    a_rows, b_rows, c_rows, meta_rows = [], [], [], []
-    for idx, rec in enumerate(srecs, 1):
-        a_rows.append("{" + ",".join(map(str, rec["a"])) + "}")
-        b_rows.append("{" + ",".join(map(str, rec["b"])) + "}")
-        c_rows.append("{" + ",".join(map(str, rec["c"])) + "}")
-        meta_rows.append("{" + ",".join(map(str, [rec["n"], rec["seed"], rec["add"], rec["step"], rec["blk"], rec["rot"], rec["rev"], rec["chk"]])) + "}")
-        guard = (guard + idx * 31 + rec["seed"] * 19 + rec["add"] * 13 + rec["step"] * 7 + rec["blk"] * 23 + rec["rot"] * 5 + rec["rev"] * 3 + rec["chk"]) % 0x100000000
-
-    final_guard = (guard ^ stream_chk) & 0xFFFFFFFF
-
-    n_dec = _fresh(used)
-    for i, t in enumerate(out_tok):
-        if t.startswith("__R") and t.endswith("__"):
-            oi = int(t[3:-2])
-            out_tok[i] = f"{n_dec}({o2n[oi]})"
-
-    body = _compact(out_tok).strip()
-
-    # Control‑flow flattening + junk
-    body = _flatten_control_flow(body, used)
-    body = _insert_junk(body, used)
-
-    # Runtime wrapper
-    lookup_code = _generate_lookup_table(lookup_name, global_map)
-    N = lambda: _fresh(used, confuse=True)
-    n_bxor, n_bor, n_band, n_ls, n_rs = N(), N(), N(), N(), N()
-    n_char, n_cat, n_type, n_floor, n_trap = N(), N(), N(), N(), N()
-    n_tA, n_tB, n_tC, n_meta, n_cache = N(), N(), N(), N(), N()
-    n_stream, n_hnd, n_disp, n_vms = N(), N(), N(), N()
-    n_gv, n_cv = N(), N()
-    n_i, n_j, n_r, n_out, n_v, n_pf = N(), N(), N(), N(), N(), N()
-    n_op, n_opr, n_pc, n_ins, n_val, n_tmp = N(), N(), N(), N(), N(), N()
-    dec = [N() for _ in range(5)]
-
-    load_wire = _mba(remap[0])
-    junk_wire = _mba(remap[1])
-    jw_raw = remap[1]
-
-    decoy_init = "\n".join(f"local {d}={_mba(secrets.randbelow(255))}" for d in dec)
-    decoy_use = f"if false then {dec[0]}={dec[1]}+{dec[2]} {dec[3]}={dec[4]}-{dec[0]} end"
-
-    rt = f"""\
-local {n_bxor}=bit32.bxor
-local {n_bor}=bit32.bor
-local {n_band}=bit32.band
-local {n_ls}=bit32.lshift
-local {n_rs}=bit32.rshift
-local {n_char}=string.char
-local {n_cat}=table.concat
-local {n_type}=type
-local {n_floor}=math.floor
-local {n_trap}=function()error("",0)end
-{decoy_init}
-{decoy_use}
-if not({n_type}(bit32)=={n_type}({{}}))then {n_trap}()end
-if not {_opaque()} then {n_trap}()end
-local {n_tA}={{{",".join(a_rows)}}}
-local {n_tB}={{{",".join(b_rows)}}}
-local {n_tC}={{{",".join(c_rows)}}}
-local {n_meta}={{{",".join(meta_rows)}}}
-local {n_cache}={{}}
-local {n_gv}=0
-for {n_i}=1,#{n_meta} do
-local {n_r}={n_meta}[{n_i}]
-{n_gv}=({n_gv}+{n_i}*31+{n_r}[2]*19+{n_r}[3]*13+{n_r}[4]*7+{n_r}[5]*23+{n_r}[6]*5+{n_r}[7]*3+{n_r}[8])%4294967296
-end
-local {n_stream}={{{",".join(map(str, stream))}}}
-local {n_cv}=0
-for {n_i}=1,#{n_stream} do {n_cv}={n_bxor}({n_cv},{n_stream}[{n_i}])end
-{n_cv}={n_band}({n_cv},4294967295)
-if {n_bxor}({n_gv}%4294967296,{n_cv})~={_mba(final_guard)} then {n_trap}()end
-if not {_opaque()} then {n_trap}()end
-local {n_dec}=function({n_i})
-if {n_cache}[{n_i}]~=nil then return {n_cache}[{n_i}]end
-local {n_r}={n_meta}[{n_i}+1]
-if {n_r}==nil then {n_trap}()end
-local {n_out}={{}}
-local {n_cv}=2166136261
-local function {n_pf}(s,pos)
-local sl=(pos-1)%3
-local si={n_floor}((pos-1)/3)+1
-if sl==0 then return {n_tA}[s][si]
-elseif sl==1 then return {n_tB}[s][si]
-else return {n_tC}[s][si]end
-end
-for {n_j}=1,{n_r}[1] do
-local src={n_j}
-if {n_r}[7]~=0 then src={n_r}[1]-{n_j}+1 end
-local {n_v}={n_pf}({n_i}+1,src)
-{n_v}={n_bxor}({n_v},{n_r}[5])
-{n_v}={n_bor}({n_rs}({n_v},{n_r}[6]),{n_ls}({n_v},8-{n_r}[6]))
-{n_v}={n_band}({n_v},255)
-{n_v}={n_bxor}({n_v},({n_r}[2]+({n_j}-1)*{n_r}[4]+{n_r}[3])%256)
-if {n_v}<0 then {n_v}={n_v}+256 end
-{n_cv}={n_band}(({n_bxor}({n_cv},{n_v})*16777619),4294967295)
-{n_out}[{n_j}]={n_char}({n_v})
-end
-if {n_cv}~={n_r}[8] then {n_trap}()end
-local {n_val}={n_cat}({n_out})
-{n_cache}[{n_i}]={n_val}
-return {n_val}
-end
-local {n_hnd}={{}}
-for {n_i}=0,15 do {n_hnd}[{n_i}]=function()return nil end end
-{n_hnd}[{load_wire}]=function({n_opr})return {n_dec}({n_opr})end
-{n_hnd}[{junk_wire}]=function()return nil end
-if {n_hnd}[{_mba(jw_raw)}]()~=nil then {n_trap}()end
-if not {_opaque()} then {n_trap}()end
-local {n_vms}={{pc=1,last=nil}}
-local {n_disp}=function()
-local {n_pc}={n_vms}.pc
-while {n_pc}<=#{n_stream} do
-local {n_ins}={n_stream}[{n_pc}]
-local {n_op}={n_ins}%16
-local {n_opr}={n_floor}({n_ins}/64)%65536
-local {n_tmp}={n_hnd}[{n_op}]
-if {n_tmp} then
-local {n_val}={n_tmp}({n_opr})
-if {n_val}~=nil then {n_vms}.last={n_val} end
-end
-{n_pc}={n_pc}+1
-end
-{n_vms}.pc={n_pc}
-end
-{n_disp}()
-{lookup_code}
-"""
-
-    header = [ATTRIBUTION]
-    if decryptor_code:
-        header.append(decryptor_code)
-    header.append(rt)
-
-    # Assemble final code, then minify it to one dense line
-    final_code = "\n".join(header) + "\n" + body + "\n"
-    return _minify(final_code)
-
-# ── Helper functions ──────────────────────────────────────────────────────────
-def _replace_globals(tokens: List[Tuple[str, str]], locals_set: Set[str],
-                     global_map: Dict[str, int], lookup_name: str) -> List[Tuple[str, str]]:
+    if not decls:
+        return parsed
+    rmap = {n: _fresh(used, confuse=True) for n in sorted(decls)}
+    prev_s = []
+    prev = ""
+    for k, v in parsed:
+        prev_s.append(prev)
+        if k not in {"whitespace", "comment", "long_comment"}:
+            prev = v
+    nxt_s = [""] * len(parsed)
+    fol = ""
+    for i in range(len(parsed) - 1, -1, -1):
+        nxt_s[i] = fol
+        k, v = parsed[i]
+        if k not in {"whitespace", "comment", "long_comment"}:
+            fol = v
     out = []
-    i = 0
-    while i < len(tokens):
-        kind, val = tokens[i]
-        if kind == "identifier" and val in global_map:
-            j = i + 1
-            while j < len(tokens) and tokens[j][0] in ("whitespace", "comment", "long_comment"):
-                j += 1
-            if j < len(tokens) and tokens[j][1] == "(":
-                if i > 0 and tokens[i-1][1] not in (".", ":"):
-                    out.append(("identifier", lookup_name))
-                    out.append(("symbol", "["))
-                    out.append(("number", str(global_map[val])))
-                    out.append(("symbol", "]"))
-                    i += 1
-                    continue
-        out.append((kind, val))
-        i += 1
+    bd = 0
+    for i, (kind, val) in enumerate(parsed):
+        if kind == "symbol":
+            if val == "{":
+                bd += 1
+            elif val == "}":
+                bd = max(0, bd - 1)
+        if kind != "identifier" or val not in rmap:
+            out.append((kind, val))
+            continue
+        is_field = (prev_s[i] in {".", ":"}) or (bd > 0 and nxt_s[i] == "=")
+        out.append((kind, val if is_field else rmap[val]))
     return out
 
-def _generate_lookup_table(lookup_name: str, global_map: Dict[str, int]) -> str:
-    if not global_map:
-        return ""
-    parts = []
-    for name, idx in global_map.items():
-        parts.append(f"{lookup_name}[{idx}]={name}")
-    return f"local {lookup_name} = {{}}\n" + "\n".join(parts) + "\n"
+def _rename_builtins(code: str, used: set[str]) -> str:
+    # Simple builtin renaming: find calls to known builtins and replace them with aliases.
+    builtins = {
+        "print", "assert", "error", "pcall", "xpcall", "type", "tostring", "tonumber",
+        "select", "next", "rawget", "rawset", "rawequal", "setmetatable", "getmetatable",
+        "loadstring", "string.byte", "string.char", "string.find", "string.format",
+        "string.gmatch", "string.gsub", "string.len", "string.lower", "string.match",
+        "string.rep", "string.reverse", "string.sub", "string.upper",
+        "table.insert", "table.remove", "table.sort", "table.concat",
+        "math.abs", "math.acos", "math.asin", "math.atan", "math.ceil", "math.cos",
+        "math.deg", "math.exp", "math.floor", "math.fmod", "math.max", "math.min",
+        "math.modf", "math.rad", "math.sin", "math.sqrt", "math.tan",
+        "os.clock", "os.date", "os.difftime", "os.time"
+    }
+    # We'll tokenize, find identifiers that are simple names of builtins (not field access),
+    # and replace them with aliases.
+    tokens = list(_tokens(code))
+    # First, find which builtins are used as non‑field identifiers.
+    used_builtins = set()
+    prev = ""
+    for kind, val in tokens:
+        if kind == "identifier" and val in builtins:
+            # check if it's a field (preceded by '.' or ':')
+            if prev not in {".", ":"}:
+                used_builtins.add(val)
+        if kind not in {"whitespace", "comment", "long_comment"}:
+            prev = val
+    if not used_builtins:
+        return code
+    # Generate aliases
+    alias_map = {}
+    for b in used_builtins:
+        alias_map[b] = _fresh(used, confuse=True)
+    # Replace in token stream with context (field protection)
+    prev = ""
+    out_tokens = []
+    for kind, val in tokens:
+        if kind == "identifier" and val in alias_map and prev not in {".", ":"}:
+            out_tokens.append(("identifier", alias_map[val]))
+        else:
+            out_tokens.append((kind, val))
+        if kind not in {"whitespace", "comment", "long_comment"}:
+            prev = val
+    new_code = _compact([v for k, v in out_tokens])
+    # Prepend local declarations
+    decl_parts = []
+    assign_parts = []
+    for alias, original in alias_map.items():
+        decl_parts.append(alias)
+        assign_parts.append(f"{alias}={original}")
+    declaration = "local " + ",".join(decl_parts) + "\n" + ";".join(assign_parts) + ";\n"
+    return declaration + new_code
 
-def _flatten_control_flow(code: str, used: Set[str]) -> str:
+def _flatten_control_flow(code: str, used: set[str]) -> str:
     state_var = _fresh(used)
     new_body = [f"local {state_var}=0", "while true do", f"if {state_var}==0 then"]
     for line in code.splitlines():
@@ -690,16 +298,16 @@ def _flatten_control_flow(code: str, used: Set[str]) -> str:
     new_body.append("end")
     return "\n".join(new_body)
 
-def _insert_junk(code: str, used: Set[str]) -> str:
+def _insert_junk(code: str, used: set[str]) -> str:
     lines = code.splitlines()
     new_lines = []
     for line in lines:
         new_lines.append(line)
-        if secrets.randbelow(100) < 30:
+        if secrets.randbelow(100) < 20:
             dummy = _fresh(used)
             junk = f"{dummy}=({_mba(secrets.randbelow(0xFFFF))})"
             new_lines.append(junk)
-        if secrets.randbelow(100) < 20:
+        if secrets.randbelow(100) < 10:
             pred = _opaque()
             if secrets.randbelow(2) == 0:
                 new_lines.append(f"if {pred} then end")
@@ -707,7 +315,133 @@ def _insert_junk(code: str, used: Set[str]) -> str:
                 new_lines.append(f"if not ({pred}) then end")
     return "\n".join(new_lines)
 
-# ── Discord cog ────────────────────────────────────────────────────────────────
+def _minify(code: str) -> str:
+    toks = list(_tokens(code))
+    filtered = [(k, v) for k, v in toks if k not in ("whitespace", "comment", "long_comment")]
+    return _compact([v for k, v in filtered])
+
+def obfuscate_luau(source: str) -> str:
+    # Step 1: preserve directives
+    directives = []
+    for line in source.splitlines():
+        if line.strip().startswith("--!"):
+            directives.append(line.strip())
+
+    # Step 2: rename locals and builtins
+    used = set()
+    tokens = list(_tokens(source))
+    tokens = _rename_locals(tokens, used)
+    source = _compact([v for k, v in tokens])
+    source = _rename_builtins(source, used)
+
+    # Step 3: encrypt strings with variable split
+    token_stream = list(_tokens(source))
+    records = []
+    out_tok = []
+    for kind, val in token_stream:
+        if kind in ("long_string", "string"):
+            enc = _encrypt_variable(val)
+            if enc is None:
+                out_tok.append(val)
+            else:
+                records.append(enc)
+                out_tok.append(f"__R{len(records)-1}__")
+        elif kind == "number":
+            out_tok.append(_mask_num(val))
+        elif kind not in ("whitespace", "comment", "long_comment"):
+            out_tok.append(val)
+    body = _compact(out_tok)
+
+    # Step 4: shuffle records
+    order = list(range(len(records)))
+    secrets.SystemRandom().shuffle(order)
+    ordered_records = [records[i] for i in order]
+    # Build chunk and meta tables
+    chunk_tables = []
+    meta_list = []
+    for rec in ordered_records:
+        chunks = rec["chunks"]
+        chunk_strs = ["{" + ",".join(map(str, ch)) + "}" for ch in chunks]
+        chunk_tables.append("{" + ",".join(chunk_strs) + "}")
+        meta_list.append(str(rec["meta"]))
+
+    # Step 5: generate decoder runtime
+    used_runtime = set()
+    N = lambda: _fresh(used_runtime, confuse=True)
+
+    decoder = N()
+    cache = N()
+    meta_tbl = N()
+    chunk_tbl = N()
+    bxor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
+    char, concat, floor, type_fn = N(), N(), N(), N()
+    trap = N()
+
+    # Build decoder function with variable split handling
+    # We'll generate code that extracts split count, then iterates over chunks.
+    decoder_code = f"""local {bxor},{bor},{band},{lshift},{rshift}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
+local {char},{concat},{floor},{type_fn}=string.char,table.concat,math.floor,type
+local {trap}=function()error("",0)end
+local {meta_tbl}={{{",".join(meta_list)}}}
+local {chunk_tbl}={{{",".join(chunk_tables)}}}
+local {cache}={{}}
+local {decoder}=function(idx)
+if {cache}[idx] then return {cache}[idx] end
+local m={meta_tbl}[idx+1]
+if not m then {trap}() end
+local split={band}(m,0xF)
+local seed={band}({rshift}(m,4),0xFF)
+local add={band}({rshift}(m,12),0xFF)
+local step={band}({rshift}(m,20),0x1F)
+local blk={band}({rshift}(m,25),0xFF)
+local rot={band}({rshift}(m,33),0x7)
+local rev={band}({rshift}(m,36),0x1)
+local chunks={chunk_tbl}[idx+1]
+local out={{}}; local chk=2166136261
+local pos=1
+for i=1,{floor}((#chunks)*1000) do
+local ci=(i-1)%split+1
+local chunk=chunks[ci]
+if not chunk then break end
+local bi=(i-1)//split+1
+local b=chunk[bi]
+if not b then break end
+local v=b
+v={bxor}(v,blk)
+v={bor}({rshift}(v,rot),{lshift}(v,8-rot))
+v={band}(v,255)
+v={bxor}(v,(seed+(i-1)*step+add)%256)
+if v<0 then v=v+256 end
+chk={band}(({bxor}(chk,v)*16777619),4294967295)
+out[i]={char}(v)
+end
+if chk~={_mba(ordered_records[0]['chk'])} then {trap}() end
+local result={concat}(out)
+{cache}[idx]=result
+return result
+end"""
+
+    # Replace placeholders in body
+    for i, t in enumerate(out_tok):
+        if t.startswith("__R") and t.endswith("__"):
+            oi = int(t[3:-2])
+            out_tok[i] = f"{decoder}({order.index(oi)})"
+    body = _compact(out_tok)
+
+    # Step 6: control‑flow flattening and junk
+    body = _flatten_control_flow(body, used)
+    body = _insert_junk(body, used)
+
+    # Step 7: assemble final code and minify
+    header = directives + [ATTRIBUTION, decoder_code]
+    final_code = "\n".join(header) + "\n" + body + "\n"
+    return _minify(final_code)
+
+# ── Discord cog ──────────────────────────────────────────────────────────────
+def _output_name(filename: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename).stem).strip("._")
+    return f"{stem or 'script'}.obfuscated.txt"
+
 class Obfuscation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
