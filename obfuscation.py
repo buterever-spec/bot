@@ -1,324 +1,256 @@
-"""
-buterfuscate – VM-based Luau obfuscator  (v3)
-==============================================
-Per-build: opcode remap, 3-way split encrypted string table, MBA constants,
-micro-op stream, dual-dispatch VM, packed instructions, opaque predicates,
-chained integrity (pool guard XOR stream checksum), FNV-1a per string,
-decoy locals/handlers, control-flow flattening, junk ops, lazy decode/cache.
-"""
-from __future__ import annotations
+# ── improved obfuscate_luau (v4) ─────────────────────────────────────────────
 
-import asyncio
-import io
-import re
+import ast
+import random
 import secrets
-from pathlib import Path
-from typing import Iterable
+import re
+from typing import List, Tuple, Set, Dict, Any
 
-import discord
-from discord import app_commands
-from discord.ext import commands
+# ... (keep your existing imports and helper functions: _fresh, _tokens, _literal_bytes,
+#      _mba, _opaque, _mask_num, _encrypt, _pack, _sep, _compact, _rename_locals,
+#      _output_name, etc.)  but replace obfuscate_luau with the one below.
 
-MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate"
-
-# ── Tokeniser ────────────────────────────────────────────────────────────────
-_TOKEN_RE = re.compile(
-    r"""
-    (?P<long_comment>--\[(?:=*)\[.*?\](?:=*)\])
-    |(?P<comment>--[^\r\n]*)
-    |(?P<whitespace>\s+)
-    |(?P<long_string>\[(?:=*)\[.*?\](?:=*)\])
-    |(?P<string>"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')
-    |(?P<number>0[xX][0-9a-fA-F]+|\d+(?:\.\d*)?(?:[eE][+-]?\d+)?)
-    |(?P<identifier>[A-Za-z_][A-Za-z0-9_]*)
-    |(?P<symbol>.)
-    """,
-    re.DOTALL | re.VERBOSE,
-)
-_CONFUSE = "IlO0"
-_ALNUM   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
-_STARTS  = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
-
-
-def _fresh(used: set[str], *, confuse: bool = False) -> str:
-    pool = (_CONFUSE * 6 + _ALNUM) if confuse else _ALNUM
-    while True:
-        n = secrets.randbelow(7) + 9
-        name = secrets.choice(_STARTS) + "".join(secrets.choice(pool) for _ in range(n))
-        if name not in used:
-            used.add(name)
-            return name
-
-
-def _tokens(src: str) -> Iterable[tuple[str, str]]:
-    pos = 0
-    while pos < len(src):
-        m = _TOKEN_RE.match(src, pos)
-        if not m:
-            yield "symbol", src[pos]; pos += 1; continue
-        pos = m.end()
-        yield m.lastgroup or "symbol", m.group(0)
-
-
-def _literal_bytes(val: str) -> list[int] | None:
-    if val.startswith("["):
-        m = re.match(r"^\[(=*)\[(.*)\]\1\]$", val, re.DOTALL)
-        return list(m.group(2).encode()) if m else None
-    if len(val) < 2 or val[0] not in {'"', "'"} or val[-1] != val[0]:
-        return None
-    body = val[1:-1]; result: list[int] = []; i = 0
-    esc = {"a":7,"b":8,"f":12,"n":10,"r":13,"t":9,"v":11,"\\": 92,"'":39,'"':34}
-    while i < len(body):
-        ch = body[i]
-        if ch != "\\":
-            result.extend(ch.encode()); i += 1; continue
+def _build_global_map(tokens: List[Tuple[str, str]], locals_set: Set[str]) -> Dict[str, int]:
+    """Identify global identifiers used as function calls and assign random indices."""
+    globals_used = set()
+    i = 0
+    while i < len(tokens):
+        kind, val = tokens[i]
+        if kind == "identifier" and val not in locals_set:
+            # look ahead for '(' (skipping whitespace/comments)
+            j = i + 1
+            while j < len(tokens) and tokens[j][0] in ("whitespace", "comment", "long_comment"):
+                j += 1
+            if j < len(tokens) and tokens[j][1] == "(":
+                # make sure it's not a method call (like obj.method)
+                if i > 0 and tokens[i-1][1] not in (".", ":"):
+                    globals_used.add(val)
         i += 1
-        if i >= len(body): return None
-        e = body[i]
-        if e in esc: result.append(esc[e]); i += 1; continue
-        if e == "x" and i + 2 < len(body):
-            d = body[i+1:i+3]
-            if re.fullmatch(r"[0-9a-fA-F]{2}", d):
-                result.append(int(d, 16)); i += 3; continue
-        if e.isdigit():
-            d = e; c = i+1
-            while c < len(body) and len(d)<3 and body[c].isdigit():
-                d += body[c]; c += 1
-            n = int(d)
-            if n > 255: return None
-            result.append(n); i = c; continue
-        if e in {"\n","\r"}:
-            if e=="\r" and i+1<len(body) and body[i+1]=="\n": i+=1
-            result.append(10); i += 1; continue
-        return None
-    return result
+    # assign random indices
+    mapping = {}
+    for name in sorted(globals_used):
+        mapping[name] = secrets.randbelow(0xFFFF) + 1
+    return mapping
 
-
-# ── Rename top-level locals ───────────────────────────────────────────────────
-def _rename_locals(parsed: list[tuple[str,str]], used: set[str]) -> list[tuple[str,str]]:
-    sig = [(i,k,v) for i,(k,v) in enumerate(parsed)
-           if k not in {"whitespace","comment","long_comment"}]
-    decls: set[str] = set(); depth = 0
-    for idx,(_,kind,val) in enumerate(sig):
-        if val=="local" and depth==0:
-            nxt = idx+1
-            if nxt<len(sig) and sig[nxt][2]=="function":
-                nxt+=1
-                if nxt<len(sig) and sig[nxt][1]=="identifier": decls.add(sig[nxt][2])
-            else:
-                expect=True
-                while nxt<len(sig):
-                    _,nk,nv=sig[nxt]
-                    if nv in {"=",";"}: break
-                    if expect and nk=="identifier": decls.add(nv); expect=False
-                    elif nv==",": expect=True
-                    nxt+=1
-        if val in {"function","do","then","repeat"}: depth+=1
-        elif val in {"end","until"}: depth=max(0,depth-1)
-    if not decls: return parsed
-    rmap={n:_fresh(used,confuse=True) for n in sorted(decls)}
-    prev_s=[]; prev=""
-    for k,v in parsed:
-        prev_s.append(prev)
-        if k not in {"whitespace","comment","long_comment"}: prev=v
-    nxt_s=[""]*len(parsed); fol=""
-    for i in range(len(parsed)-1,-1,-1):
-        nxt_s[i]=fol
-        k,v=parsed[i]
-        if k not in {"whitespace","comment","long_comment"}: fol=v
-    out=[]; bd=0
-    for i,(kind,val) in enumerate(parsed):
-        if kind=="symbol":
-            if val=="{": bd+=1
-            elif val=="}": bd=max(0,bd-1)
-        if kind!="identifier" or val not in rmap:
-            out.append((kind,val)); continue
-        is_field=(prev_s[i] in {".",":" } or (bd>0 and nxt_s[i]=="="))
-        out.append((kind, val if is_field else rmap[val]))
+def _replace_globals(tokens: List[Tuple[str, str]], locals_set: Set[str],
+                     global_map: Dict[str, int]) -> List[Tuple[str, str]]:
+    """Replace global identifiers used as calls with _G_LOOKUP[index]."""
+    out = []
+    i = 0
+    while i < len(tokens):
+        kind, val = tokens[i]
+        if kind == "identifier" and val in global_map:
+            # check if it's a call (next non‑whitespace is '(')
+            j = i + 1
+            while j < len(tokens) and tokens[j][0] in ("whitespace", "comment", "long_comment"):
+                j += 1
+            if j < len(tokens) and tokens[j][1] == "(":
+                # ensure it's not a method call (preceded by '.' or ':')
+                if i > 0 and tokens[i-1][1] not in (".", ":"):
+                    out.append(("identifier", "_G_LOOKUP"))
+                    out.append(("symbol", "["))
+                    out.append(("number", str(global_map[val])))
+                    out.append(("symbol", "]"))
+                    i += 1
+                    continue
+        out.append((kind, val))
+        i += 1
     return out
 
+def _flatten_control_flow(code: str, used: Set[str]) -> str:
+    """Wrap the entire script in a while loop with a state variable (simple flattening)."""
+    # This is a simplistic approach: we take the whole body and put it in a function,
+    # then replace the function body with a while-loop dispatcher.
+    # For real flattening we would need to parse basic blocks, but here we'll
+    # just wrap the code in a loop that executes once with a state.
+    # This still hides the linear flow somewhat.
+    state_var = _fresh(used)
+    new_body = []
+    new_body.append(f"local {state_var}=0")
+    new_body.append("while true do")
+    new_body.append("if "+state_var+"==0 then")
+    # insert the original code indented
+    for line in code.splitlines():
+        new_body.append("    "+line)
+    new_body.append(f"    {state_var}=1")
+    new_body.append("elseif "+state_var+"==1 then")
+    new_body.append("    break")
+    new_body.append("end")
+    new_body.append("end")
+    return "\n".join(new_body)
 
-# ── MBA helpers ───────────────────────────────────────────────────────────────
-def _mba(n: int) -> str:
-    n &= 0xFFFFFFFF
-    s = secrets.randbelow(6)
-    if s==0:
-        k=secrets.randbelow(0x7FFF)+1; return f"bit32.bxor({n^k},{k})"
-    if s==1:
-        k=secrets.randbelow(200)+5; return f"({n+k}-{k})"
-    if s==2:
-        k=secrets.randbelow(50)+2; return f"(({n*k})//{k})"
-    if s==3:
-        k=secrets.randbelow(0xFF)+1
-        return f"bit32.band(bit32.bor({n},{k}),bit32.bxor({n|k},{k^(n&k)}))"
-    if s==4:
-        r=secrets.randbelow(7)+1
-        rot=((n<<r)|(n>>(32-r)))&0xFFFFFFFF
-        return f"bit32.bor(bit32.rshift({rot},{r}),bit32.lshift({rot},32-{r}))"
-    a=secrets.randbelow(0xFFF)+1; return f"bit32.bxor({n^a},{a})"
+def _insert_junk(code: str, used: Set[str]) -> str:
+    """Insert random junk statements and opaque predicates between lines."""
+    lines = code.splitlines()
+    new_lines = []
+    for line in lines:
+        new_lines.append(line)
+        # insert junk after about 30% of lines
+        if secrets.randbelow(100) < 30:
+            dummy = _fresh(used)
+            junk = f"{dummy}=({_mba(secrets.randbelow(0xFFFF))})"
+            new_lines.append(junk)
+        # insert opaque predicate if statement
+        if secrets.randbelow(100) < 20:
+            pred = _opaque()
+            if secrets.randbelow(2) == 0:
+                new_lines.append(f"if {pred} then end")
+            else:
+                new_lines.append(f"if not ({pred}) then end")
+    return "\n".join(new_lines)
 
+def _generate_lookup_table(global_map: Dict[str, int]) -> str:
+    """Create a table that maps indices to the actual global functions."""
+    parts = []
+    for name, idx in global_map.items():
+        # we need to assign the global function to the table at that index
+        parts.append(f"_[{idx}]={name}")
+    return "local _G_LOOKUP = {}\n" + "\n".join(parts) + "\n"
 
-def _opaque() -> str:
-    s=secrets.randbelow(4)
-    if s==0:
-        x=secrets.randbelow(200)+5; return f"(bit32.bxor({x},{x})==0)"
-    if s==1:
-        x=secrets.randbelow(100)+1; return f"(bit32.band({x},0)==0)"
-    if s==2:
-        x=secrets.randbelow(50)+2; return f"(({x*2})//{x}==2)"
-    x=secrets.randbelow(0xFF)+1; return f"(bit32.bor({x},0)=={x})"
+def obfuscate_luau(source: str) -> str:
+    used: Set[str] = {v for k, v in _tokens(source) if k == "identifier"}
 
+    # 1. rename locals
+    parsed = _rename_locals(list(_tokens(source)), used)
+    # rebuild set of local names (after rename)
+    locals_set = set()
+    # (we can collect locals from parsed tokens, but we already have used after rename? We'll just reuse the same logic)
+    # For simplicity, we'll recompute locals from the parsed tokens
+    # but the rename function already added renamed names to used, so we can use that.
+    # However, we need to know which identifiers are local; we can use the same logic as _rename_locals
+    # but we already have the original source's locals. Let's collect them from the original source before rename.
+    # For the global replacement, we need to know which identifiers are local in the original source.
+    # We'll run the local detection again on the parsed tokens (they are already renamed).
+    # But we need the original local names to map to renamed ones? Actually, after rename, all locals have new names,
+    # and global identifiers remain unchanged. So we can detect locals from the parsed tokens by looking at declarations.
+    # We'll write a simple function to collect local names from parsed tokens.
+    local_names = set()
+    sig = [(i, k, v) for i, (k, v) in enumerate(parsed) if k not in ("whitespace", "comment", "long_comment")]
+    depth = 0
+    for i, (_, kind, val) in enumerate(sig):
+        if val == "local" and depth == 0:
+            nxt = i + 1
+            if nxt < len(sig) and sig[nxt][2] == "function":
+                nxt += 1
+                if nxt < len(sig) and sig[nxt][1] == "identifier":
+                    local_names.add(sig[nxt][2])
+            else:
+                expect = True
+                while nxt < len(sig):
+                    _, nk, nv = sig[nxt]
+                    if nv in ("=", ";"):
+                        break
+                    if expect and nk == "identifier":
+                        local_names.add(nv)
+                        expect = False
+                    elif nv == ",":
+                        expect = True
+                    nxt += 1
+        if val in ("function", "do", "then", "repeat"):
+            depth += 1
+        elif val in ("end", "until"):
+            depth = max(0, depth - 1)
+    # now we have local names (renamed)
 
-# ── Number masking ────────────────────────────────────────────────────────────
-def _mask_num(val: str) -> str:
-    if not re.fullmatch(r"\d+", val) or len(val)>7: return val
-    n=int(val)
-    if n>9_999_999: return val
-    return _mba(n)
+    # 2. build global map from original tokens before renaming? Actually we need to use the original identifiers,
+    #    but after renaming, globals remain same. So we can use parsed tokens and locals_set.
+    global_map = _build_global_map(parsed, local_names)
+    # 3. replace globals with lookup
+    parsed = _replace_globals(parsed, local_names, global_map)
 
-
-# ── 3-stage string encryption → record ───────────────────────────────────────
-def _encrypt(val: str) -> dict | None:
-    plain=_literal_bytes(val)
-    if plain is None: return None
-    n=len(plain)
-    if n==0:
-        return {"a":[],"b":[],"c":[],"seed":0,"add":0,"step":0,
-                "blk":0,"rot":0,"rev":0,"n":0,"chk":2166136261}
-    seed=secrets.randbelow(251)+1; add=secrets.randbelow(251)
-    step=secrets.randbelow(31)+1;  blk=secrets.randbelow(251)+1
-    rot=secrets.randbelow(7)+1;    rev=secrets.randbelow(2)
-    s1=[b^((seed+i*step+add)%256) for i,b in enumerate(plain)]
-    s2=[((b<<rot)|(b>>(8-rot)))&0xFF for b in s1]
-    s3=[b^blk for b in s2]
-    if rev: s3=s3[::-1]
-    chk=2166136261
-    for b in plain: chk=((chk^b)*16777619)&0xFFFFFFFF
-    return {"a":s3[0::3],"b":s3[1::3],"c":s3[2::3],
-            "seed":seed,"add":add,"step":step,"blk":blk,
-            "rot":rot,"rev":rev,"n":n,"chk":chk}
-
-
-# ── Micro-ops ─────────────────────────────────────────────────────────────────
-OP_LOAD=0; OP_JUNK=1; _REAL_OPS=2
-
-
-def _pack(op:int, operand:int, remap:list[int]) -> int:
-    return (remap[op]&0xF)|((secrets.randbelow(4)&0x3)<<4)|((operand&0xFFFF)<<6)
-
-
-# ── Token separator ───────────────────────────────────────────────────────────
-def _sep(a:str,b:str)->bool:
-    if not a or not b: return False
-    if (a[-1].isalnum() or a[-1]=="_") and (b[0].isalnum() or b[0]=="_"): return True
-    return a.endswith("-") and b.startswith("-")
-
-
-def _compact(tokens:list[str])->str:
-    out=[]
-    for t in tokens:
-        if out and _sep(out[-1],t): out.append(" ")
-        out.append(t)
-    return "".join(out)
-
-
-# ── Main obfuscation ──────────────────────────────────────────────────────────
-def obfuscate_luau(source: str) -> str:          # noqa: C901
-    used:set[str]={v for k,v in _tokens(source) if k=="identifier"}
-
-    parsed=_rename_locals(list(_tokens(source)),used)
-
-    records:list[dict]=[]; out_tok:list[str]=[]; num_i=0
-    directives:list[str]=[]
-    for kind,val in parsed:
-        if kind in {"comment","long_comment"}:
-            s=val.strip()
-            if s.startswith("--!"): directives.append(s)
+    # 4. process strings and numbers (same as before)
+    records = []
+    out_tok = []
+    for kind, val in parsed:
+        if kind in ("comment", "long_comment"):
             continue
-        if kind=="whitespace": continue
-        if kind in {"string","long_string"}:
-            rec=_encrypt(val)
-            if rec is None: out_tok.append(val)
-            else: records.append(rec); out_tok.append(f"__R{len(records)-1}__")
+        if kind == "whitespace":
             continue
-        if kind=="number": out_tok.append(_mask_num(val)); num_i+=1; continue
+        if kind in ("string", "long_string"):
+            rec = _encrypt(val)
+            if rec is None:
+                out_tok.append(val)
+            else:
+                records.append(rec)
+                out_tok.append(f"__R{len(records)-1}__")
+            continue
+        if kind == "number":
+            out_tok.append(_mask_num(val))
+            continue
         out_tok.append(val)
 
-    # Shuffle constant pool
-    pool_ord=list(range(len(records)))
+    # shuffle and pack strings
+    pool_ord = list(range(len(records)))
     secrets.SystemRandom().shuffle(pool_ord)
-    o2n={old:new for new,old in enumerate(pool_ord)}
-    srecs=[records[o] for o in pool_ord]
+    o2n = {old: new for new, old in enumerate(pool_ord)}
+    srecs = [records[o] for o in pool_ord]
 
-    # Opcode remap  (4 slots used, rest are decoy wire values)
-    slots=list(range(16)); secrets.SystemRandom().shuffle(slots)
-    remap=slots[:_REAL_OPS]          # remap[OP_LOAD], remap[OP_JUNK]
-
-    # Build packed micro-op stream
-    stream:list[int]=[]
+    # build opcode stream (same)
+    slots = list(range(16))
+    secrets.SystemRandom().shuffle(slots)
+    remap = slots[:2]  # OP_LOAD, OP_JUNK
+    stream = []
     for old_idx in range(len(records)):
-        for _ in range(secrets.randbelow(3)):       # leading junk
-            stream.append(_pack(OP_JUNK,secrets.randbelow(0xFFFF),remap))
-        stream.append(_pack(OP_LOAD,o2n[old_idx],remap))
-    for _ in range(secrets.randbelow(4)):           # trailing junk
-        stream.append(_pack(OP_JUNK,secrets.randbelow(0xFFFF),remap))
+        for _ in range(secrets.randbelow(3)):
+            stream.append(_pack(1, secrets.randbelow(0xFFFF), remap))  # junk
+        stream.append(_pack(0, o2n[old_idx], remap))  # load
+    for _ in range(secrets.randbelow(4)):
+        stream.append(_pack(1, secrets.randbelow(0xFFFF), remap))
 
-    # Opcode checksum  (XOR of all packed words)
-    stream_chk=0
-    for p in stream: stream_chk^=p
-    stream_chk&=0xFFFFFFFF
+    stream_chk = 0
+    for p in stream:
+        stream_chk ^= p
+    stream_chk &= 0xFFFFFFFF
 
-    # Pool integrity guard
-    guard=0
-    a_rows=[]; b_rows=[]; c_rows=[]; meta_rows=[]
-    for idx,rec in enumerate(srecs,1):
-        a_rows.append("{"+",".join(map(str,rec["a"]))+"}")
-        b_rows.append("{"+",".join(map(str,rec["b"]))+"}")
-        c_rows.append("{"+",".join(map(str,rec["c"]))+"}")
-        meta_rows.append("{"+",".join(map(str,[
-            rec["n"],rec["seed"],rec["add"],rec["step"],
-            rec["blk"],rec["rot"],rec["rev"],rec["chk"],
-        ]))+"}")
-        guard=(guard+idx*31+rec["seed"]*19+rec["add"]*13+rec["step"]*7+
-               rec["blk"]*23+rec["rot"]*5+rec["rev"]*3+rec["chk"])%0x100000000
+    # pool integrity
+    guard = 0
+    a_rows, b_rows, c_rows, meta_rows = [], [], [], []
+    for idx, rec in enumerate(srecs, 1):
+        a_rows.append("{" + ",".join(map(str, rec["a"])) + "}")
+        b_rows.append("{" + ",".join(map(str, rec["b"])) + "}")
+        c_rows.append("{" + ",".join(map(str, rec["c"])) + "}")
+        meta_rows.append("{" + ",".join(map(str, [rec["n"], rec["seed"], rec["add"], rec["step"], rec["blk"], rec["rot"], rec["rev"], rec["chk"]])) + "}")
+        guard = (guard + idx * 31 + rec["seed"] * 19 + rec["add"] * 13 + rec["step"] * 7 + rec["blk"] * 23 + rec["rot"] * 5 + rec["rev"] * 3 + rec["chk"]) % 0x100000000
 
-    final_guard=(guard^stream_chk)&0xFFFFFFFF
+    final_guard = (guard ^ stream_chk) & 0xFFFFFFFF
 
-    # Replace placeholders → decode(new_idx)
-    N=lambda:_fresh(used,confuse=True)
-    n_dec=N()
-    for i,t in enumerate(out_tok):
+    # replace placeholders with decode calls
+    n_dec = _fresh(used)
+    for i, t in enumerate(out_tok):
         if t.startswith("__R") and t.endswith("__"):
-            oi=int(t[3:-2])
-            out_tok[i]=f"{n_dec}({o2n[oi]})"
+            oi = int(t[3:-2])
+            out_tok[i] = f"{n_dec}({o2n[oi]})"
 
-    body=_compact(out_tok).strip()
+    body = _compact(out_tok).strip()
 
-    # ── Runtime names ──
-    n_bxor=N();n_bor=N();n_band=N();n_ls=N();n_rs=N()
-    n_char=N();n_cat=N();n_type=N();n_floor=N();n_trap=N()
-    n_tA=N();n_tB=N();n_tC=N();n_meta=N();n_cache=N()
-    n_stream=N();n_hnd=N();n_disp=N();n_vms=N()
-    n_gv=N();n_cv=N()
-    n_i=N();n_j=N();n_r=N();n_out=N();n_v=N();n_pf=N()
-    n_op=N();n_opr=N();n_pc=N();n_ins=N();n_val=N();n_tmp=N()
-    dec=[N() for _ in range(5)]
+    # 5. control-flow flattening on the body (simple)
+    body = _flatten_control_flow(body, used)
 
-    # MBA-masked wire values used in runtime
-    load_wire=_mba(remap[OP_LOAD])
-    junk_wire=_mba(remap[OP_JUNK])
-    fg_expr=_mba(final_guard)
-    jw_raw=remap[OP_JUNK]
+    # 6. inject junk code
+    body = _insert_junk(body, used)
 
-    stream_lit="{"+",".join(map(str,stream))+"}"
-    op1=_opaque();op2=_opaque();op3=_opaque()
+    # 7. generate the runtime wrapper (with lookup table for globals)
+    N = lambda: _fresh(used, confuse=True)
+    n_bxor, n_bor, n_band, n_ls, n_rs = N(), N(), N(), N(), N()
+    n_char, n_cat, n_type, n_floor, n_trap = N(), N(), N(), N(), N()
+    n_tA, n_tB, n_tC, n_meta, n_cache = N(), N(), N(), N(), N()
+    n_stream, n_hnd, n_disp, n_vms = N(), N(), N(), N()
+    n_gv, n_cv = N(), N()
+    n_i, n_j, n_r, n_out, n_v, n_pf = N(), N(), N(), N(), N(), N()
+    n_op, n_opr, n_pc, n_ins, n_val, n_tmp = N(), N(), N(), N(), N(), N()
+    dec = [N() for _ in range(5)]
 
-    decoy_init="\n".join(f"local {d}={_mba(secrets.randbelow(255))}" for d in dec)
-    decoy_use=(f"if false then {dec[0]}={dec[1]}+{dec[2]} "
-               f"{dec[3]}={dec[4]}-{dec[0]} end")
+    load_wire = _mba(remap[0])
+    junk_wire = _mba(remap[1])
+    jw_raw = remap[1]
 
-    rt=f"""\
+    # lookup table code
+    lookup_code = _generate_lookup_table(global_map) if global_map else ""
+
+    decoy_init = "\n".join(f"local {d}={_mba(secrets.randbelow(255))}" for d in dec)
+    decoy_use = f"if false then {dec[0]}={dec[1]}+{dec[2]} {dec[3]}={dec[4]}-{dec[0]} end"
+
+    rt = f"""\
 local {n_bxor}=bit32.bxor
 local {n_bor}=bit32.bor
 local {n_band}=bit32.band
@@ -332,7 +264,7 @@ local {n_trap}=function()error("",0)end
 {decoy_init}
 {decoy_use}
 if not({n_type}(bit32)=={n_type}({{}}))then {n_trap}()end
-if not {op1} then {n_trap}()end
+if not {_opaque()} then {n_trap}()end
 local {n_tA}={{{",".join(a_rows)}}}
 local {n_tB}={{{",".join(b_rows)}}}
 local {n_tC}={{{",".join(c_rows)}}}
@@ -343,12 +275,12 @@ for {n_i}=1,#{n_meta} do
 local {n_r}={n_meta}[{n_i}]
 {n_gv}=({n_gv}+{n_i}*31+{n_r}[2]*19+{n_r}[3]*13+{n_r}[4]*7+{n_r}[5]*23+{n_r}[6]*5+{n_r}[7]*3+{n_r}[8])%4294967296
 end
-local {n_stream}={stream_lit}
+local {n_stream}={{{",".join(map(str, stream))}}}
 local {n_cv}=0
 for {n_i}=1,#{n_stream} do {n_cv}={n_bxor}({n_cv},{n_stream}[{n_i}])end
 {n_cv}={n_band}({n_cv},4294967295)
-if {n_bxor}({n_gv}%4294967296,{n_cv})~={fg_expr} then {n_trap}()end
-if not {op2} then {n_trap}()end
+if {n_bxor}({n_gv}%4294967296,{n_cv})~={_mba(final_guard)} then {n_trap}()end
+if not {_opaque()} then {n_trap}()end
 local {n_dec}=function({n_i})
 if {n_cache}[{n_i}]~=nil then return {n_cache}[{n_i}]end
 local {n_r}={n_meta}[{n_i}+1]
@@ -384,7 +316,7 @@ for {n_i}=0,15 do {n_hnd}[{n_i}]=function()return nil end end
 {n_hnd}[{load_wire}]=function({n_opr})return {n_dec}({n_opr})end
 {n_hnd}[{junk_wire}]=function()return nil end
 if {n_hnd}[{_mba(jw_raw)}]()~=nil then {n_trap}()end
-if not {op3} then {n_trap}()end
+if not {_opaque()} then {n_trap}()end
 local {n_vms}={{pc=1,last=nil}}
 local {n_disp}=function()
 local {n_pc}={n_vms}.pc
@@ -402,56 +334,8 @@ end
 {n_vms}.pc={n_pc}
 end
 {n_disp}()
+{lookup_code}
 """
 
-    header=[*dict.fromkeys(directives), ATTRIBUTION, rt]
-    return "\n".join(header)+"\n"+body+"\n"
-
-
-# ── Output filename ───────────────────────────────────────────────────────────
-def _output_name(filename:str)->str:
-    stem=re.sub(r"[^A-Za-z0-9_.-]+","_",Path(filename).stem).strip("._")
-    return f"{stem or 'script'}.obfuscated.txt"
-
-
-# ── Discord cog ───────────────────────────────────────────────────────────────
-class Obfuscation(commands.Cog):
-    def __init__(self,bot:commands.Bot):
-        self.bot=bot
-
-    @app_commands.command(name="obf",description="Obfuscate a Luau .TXT file")
-    @app_commands.describe(file="Attach the .TXT Luau source file to obfuscate")
-    async def obf(self,interaction:discord.Interaction,
-                  file:discord.Attachment|None=None):
-        if file is None:
-            await interaction.response.send_message(
-                "Attach a `.TXT` file to continue.",ephemeral=True); return
-        if not file.filename.lower().endswith(".txt"):
-            await interaction.response.send_message(
-                "Only `.TXT` files are supported.",ephemeral=True); return
-        if file.size and file.size>MAX_SOURCE_BYTES:
-            await interaction.response.send_message(
-                f"Too large. Limit is {MAX_SOURCE_BYTES//1000} KB.",ephemeral=True); return
-        await interaction.response.defer(thinking=True)
-        try:
-            src=await file.read()
-            if len(src)>MAX_SOURCE_BYTES: raise ValueError("Too large.")
-            source=src.decode("utf-8-sig")
-            if not source.strip(): raise ValueError("Empty file.")
-            obf=await asyncio.to_thread(obfuscate_luau,source)
-            out=discord.File(io.BytesIO(obf.encode()),filename=_output_name(file.filename))
-            await interaction.followup.send(
-                content="-obfuscated by buterfuscate",file=out,
-                allowed_mentions=discord.AllowedMentions.none())
-        except UnicodeDecodeError:
-            await interaction.followup.send(
-                "Could not read as UTF-8.",ephemeral=True)
-        except ValueError as e:
-            await interaction.followup.send(str(e),ephemeral=True)
-        except Exception:
-            await interaction.followup.send(
-                "Obfuscation failed. Check the file and try again.",ephemeral=True)
-
-
-async def setup(bot:commands.Bot):
-    await bot.add_cog(Obfuscation(bot))
+    header = ["-- obfuscated by buterfuscate v4", rt]
+    return "\n".join(header) + "\n" + body + "\n"
