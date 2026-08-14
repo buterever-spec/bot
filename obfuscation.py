@@ -136,7 +136,7 @@ def _encrypt_variable(val: str) -> dict | None:
         return None
     n = len(plain)
     if n == 0:
-        return {"chunks": [[]], "meta": 0, "chk": 2166136261}
+        return {"chunks": [[]], "meta": 0, "chk": 2166136261, "len": 0}
     split_count = secrets.randbelow(4) + 2  # 2-5
     seed = secrets.randbelow(251) + 1
     add = secrets.randbelow(251)
@@ -157,7 +157,7 @@ def _encrypt_variable(val: str) -> dict | None:
     for b in plain:
         chk = ((chk ^ b) * 16777619) & 0xFFFFFFFF
     meta = _pack_meta(split_count, seed, add, step, blk, rot, rev)
-    return {"chunks": chunks, "meta": meta, "chk": chk}
+    return {"chunks": chunks, "meta": meta, "chk": chk, "len": n}
 
 def _compact(tokens: list[str]) -> str:
     out = []
@@ -234,7 +234,6 @@ def _rename_locals(parsed: list[tuple[str, str]], used: set[str]) -> list[tuple[
     return out
 
 def _rename_builtins(code: str, used: set[str]) -> str:
-    # Simple builtin renaming: find calls to known builtins and replace them with aliases.
     builtins = {
         "print", "assert", "error", "pcall", "xpcall", "type", "tostring", "tonumber",
         "select", "next", "rawget", "rawset", "rawequal", "setmetatable", "getmetatable",
@@ -247,26 +246,20 @@ def _rename_builtins(code: str, used: set[str]) -> str:
         "math.modf", "math.rad", "math.sin", "math.sqrt", "math.tan",
         "os.clock", "os.date", "os.difftime", "os.time"
     }
-    # We'll tokenize, find identifiers that are simple names of builtins (not field access),
-    # and replace them with aliases.
     tokens = list(_tokens(code))
-    # First, find which builtins are used as non‑field identifiers.
     used_builtins = set()
     prev = ""
     for kind, val in tokens:
         if kind == "identifier" and val in builtins:
-            # check if it's a field (preceded by '.' or ':')
             if prev not in {".", ":"}:
                 used_builtins.add(val)
         if kind not in {"whitespace", "comment", "long_comment"}:
             prev = val
     if not used_builtins:
         return code
-    # Generate aliases
     alias_map = {}
     for b in used_builtins:
         alias_map[b] = _fresh(used, confuse=True)
-    # Replace in token stream with context (field protection)
     prev = ""
     out_tokens = []
     for kind, val in tokens:
@@ -277,7 +270,6 @@ def _rename_builtins(code: str, used: set[str]) -> str:
         if kind not in {"whitespace", "comment", "long_comment"}:
             prev = val
     new_code = _compact([v for k, v in out_tokens])
-    # Prepend local declarations
     decl_parts = []
     assign_parts = []
     for alias, original in alias_map.items():
@@ -356,14 +348,19 @@ def obfuscate_luau(source: str) -> str:
     order = list(range(len(records)))
     secrets.SystemRandom().shuffle(order)
     ordered_records = [records[i] for i in order]
-    # Build chunk and meta tables
+
+    # Build tables for meta, chunks, lengths, checksums
     chunk_tables = []
     meta_list = []
+    len_list = []
+    chk_list = []
     for rec in ordered_records:
         chunks = rec["chunks"]
         chunk_strs = ["{" + ",".join(map(str, ch)) + "}" for ch in chunks]
         chunk_tables.append("{" + ",".join(chunk_strs) + "}")
         meta_list.append(str(rec["meta"]))
+        len_list.append(str(rec["len"]))
+        chk_list.append(str(rec["chk"]))
 
     # Step 5: generate decoder runtime
     used_runtime = set()
@@ -373,21 +370,25 @@ def obfuscate_luau(source: str) -> str:
     cache = N()
     meta_tbl = N()
     chunk_tbl = N()
+    len_tbl = N()
+    chk_tbl = N()
     bxor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
     char, concat, floor, type_fn = N(), N(), N(), N()
     trap = N()
 
-    # Build decoder function with variable split handling
-    # We'll generate code that extracts split count, then iterates over chunks.
     decoder_code = f"""local {bxor},{bor},{band},{lshift},{rshift}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
 local {char},{concat},{floor},{type_fn}=string.char,table.concat,math.floor,type
 local {trap}=function()error("",0)end
 local {meta_tbl}={{{",".join(meta_list)}}}
 local {chunk_tbl}={{{",".join(chunk_tables)}}}
+local {len_tbl}={{{",".join(len_list)}}}
+local {chk_tbl}={{{",".join(chk_list)}}}
 local {cache}={{}}
 local {decoder}=function(idx)
 if {cache}[idx] then return {cache}[idx] end
 local m={meta_tbl}[idx+1]
+local n={len_tbl}[idx+1]
+local expected={chk_tbl}[idx+1]
 if not m then {trap}() end
 local split={band}(m,0xF)
 local seed={band}({rshift}(m,4),0xFF)
@@ -398,14 +399,13 @@ local rot={band}({rshift}(m,33),0x7)
 local rev={band}({rshift}(m,36),0x1)
 local chunks={chunk_tbl}[idx+1]
 local out={{}}; local chk=2166136261
-local pos=1
-for i=1,{floor}((#chunks)*1000) do
+for i=1,n do
 local ci=(i-1)%split+1
 local chunk=chunks[ci]
-if not chunk then break end
+if not chunk then {trap}() end
 local bi=(i-1)//split+1
 local b=chunk[bi]
-if not b then break end
+if not b then {trap}() end
 local v=b
 v={bxor}(v,blk)
 v={bor}({rshift}(v,rot),{lshift}(v,8-rot))
@@ -413,9 +413,11 @@ v={band}(v,255)
 v={bxor}(v,(seed+(i-1)*step+add)%256)
 if v<0 then v=v+256 end
 chk={band}(({bxor}(chk,v)*16777619),4294967295)
-out[i]={char}(v)
+local pos = i
+if rev==1 then pos = n - i + 1 end
+out[pos]={char}(v)
 end
-if chk~={_mba(ordered_records[0]['chk'])} then {trap}() end
+if chk~=expected then {trap}() end
 local result={concat}(out)
 {cache}[idx]=result
 return result
