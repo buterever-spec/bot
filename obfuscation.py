@@ -1,5 +1,3 @@
-# ── Full corrected obfuscate_luau (v7) ──────────────────────────────────────
-
 from __future__ import annotations
 
 import asyncio
@@ -396,6 +394,15 @@ def _rename_variables(code: str, target: str = "luau") -> str:
 
     return final_code
 
+# ── Minify ────────────────────────────────────────────────────────────────────
+def _minify(code: str) -> str:
+    """Remove all unnecessary whitespace and comments, produce a single line."""
+    toks = list(_tokens(code))
+    # strip whitespace and comment tokens
+    filtered = [(k, v) for k, v in toks if k not in ("whitespace", "comment", "long_comment")]
+    # use _compact to add spaces only where needed
+    return _compact([v for k, v in filtered])
+
 # ── Main obfuscation ──────────────────────────────────────────────────────────
 def obfuscate_luau(source: str) -> str:
     # Step 1: Variable Renamer (locals and builtins)
@@ -635,7 +642,10 @@ end
     if decryptor_code:
         header.append(decryptor_code)
     header.append(rt)
-    return "\n".join(header) + "\n" + body + "\n"
+
+    # Assemble final code, then minify it to one dense line
+    final_code = "\n".join(header) + "\n" + body + "\n"
+    return _minify(final_code)
 
 # ── Helper functions ──────────────────────────────────────────────────────────
 def _replace_globals(tokens: List[Tuple[str, str]], locals_set: Set[str],
@@ -730,7 +740,7 @@ class Obfuscation(commands.Cog):
         except ValueError as e:
             await interaction.followup.send(str(e), ephemeral=True)
         except Exception as e:
-            print(f"Obfuscation error: {e}")  # Log to console
+            print(f"Obfuscation error: {e}")
             await interaction.followup.send("Obfuscation failed. Check the file and try again.", ephemeral=True)
 
 async def setup(bot: commands.Bot):
