@@ -1,3 +1,5 @@
+# ── Full corrected obfuscate_luau (v7) ──────────────────────────────────────
+
 from __future__ import annotations
 
 import asyncio
@@ -22,7 +24,7 @@ except ImportError:
     HAS_LUAPARSER = False
 
 MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate v6"
+ATTRIBUTION = "-- obfuscated by buterfuscate v7"
 
 # ── Tokeniser ──────────────────────────────────────────────────────────────
 _TOKEN_RE = re.compile(
@@ -332,9 +334,8 @@ def _rename_variables(code: str, target: str = "luau") -> str:
     # Step 2: find builtins used as non‑field identifiers
     builtin_simple_names = {b.split(".")[-1] for b in BUILTINS}
     if target == "luau":
-        builtin_simple_names.discard("type")   # 'type' is a keyword in Luau
-        # Also remove string.dump if not present
-        builtin_simple_names.discard("dump")   # safe
+        builtin_simple_names.discard("type")
+        builtin_simple_names.discard("dump")
 
     # Compute context for tokens_renamed (field detection)
     prev_s = [""] * len(tokens_renamed)
@@ -366,14 +367,14 @@ def _rename_variables(code: str, target: str = "luau") -> str:
     if not builtin_used:
         return code_renamed
 
-    # Step 3: generate aliases (avoid name conflicts)
-    used_names = set(used)  # contains all renamed locals
+    # Step 3: generate aliases
+    used_names = set(used)
     builtin_alias = {}
     for name in builtin_used:
         new_name = _fresh(used_names, confuse=True)
         builtin_alias[name] = new_name
 
-    # Step 4: replace builtin identifiers in tokens_renamed (with context)
+    # Step 4: replace builtin identifiers in tokens_renamed
     output_tokens = []
     for i, (kind, val) in enumerate(tokens_renamed):
         if kind == "identifier":
@@ -384,7 +385,7 @@ def _rename_variables(code: str, target: str = "luau") -> str:
         output_tokens.append((kind, val))
     final_code = _compact([v for k, v in output_tokens])
 
-    # Step 5: prepend local declarations for aliases
+    # Step 5: prepend local declarations
     decl_parts = []
     assign_parts = []
     for alias, original in builtin_alias.items():
@@ -453,8 +454,11 @@ def obfuscate_luau(source: str) -> str:
                     global_map[val] = secrets.randbelow(0xFFFF) + 1
         i += 1
 
-    # Replace globals with lookup
-    parsed = _replace_globals(parsed, local_names, global_map)
+    # Generate unique name for lookup table
+    lookup_name = _fresh(used)
+
+    # Replace globals with lookup_name
+    parsed = _replace_globals(parsed, local_names, global_map, lookup_name)
 
     # Process strings and numbers for the VM
     records = []
@@ -522,7 +526,7 @@ def obfuscate_luau(source: str) -> str:
     body = _insert_junk(body, used)
 
     # Runtime wrapper
-    lookup_code = _generate_lookup_table(global_map) if global_map else ""
+    lookup_code = _generate_lookup_table(lookup_name, global_map)
     N = lambda: _fresh(used, confuse=True)
     n_bxor, n_bor, n_band, n_ls, n_rs = N(), N(), N(), N(), N()
     n_char, n_cat, n_type, n_floor, n_trap = N(), N(), N(), N(), N()
@@ -610,7 +614,7 @@ if not {_opaque()} then {n_trap}()end
 local {n_vms}={{pc=1,last=nil}}
 local {n_disp}=function()
 local {n_pc}={n_vms}.pc
-while {n_pc}<=#{{n_stream}} do
+while {n_pc}<=#{n_stream} do
 local {n_ins}={n_stream}[{n_pc}]
 local {n_op}={n_ins}%16
 local {n_opr}={n_floor}({n_ins}/64)%65536
@@ -633,9 +637,9 @@ end
     header.append(rt)
     return "\n".join(header) + "\n" + body + "\n"
 
-# ── Helper functions for replacement ──────────────────────────────────────────
+# ── Helper functions ──────────────────────────────────────────────────────────
 def _replace_globals(tokens: List[Tuple[str, str]], locals_set: Set[str],
-                     global_map: Dict[str, int]) -> List[Tuple[str, str]]:
+                     global_map: Dict[str, int], lookup_name: str) -> List[Tuple[str, str]]:
     out = []
     i = 0
     while i < len(tokens):
@@ -646,7 +650,7 @@ def _replace_globals(tokens: List[Tuple[str, str]], locals_set: Set[str],
                 j += 1
             if j < len(tokens) and tokens[j][1] == "(":
                 if i > 0 and tokens[i-1][1] not in (".", ":"):
-                    out.append(("identifier", "_G_LOOKUP"))
+                    out.append(("identifier", lookup_name))
                     out.append(("symbol", "["))
                     out.append(("number", str(global_map[val])))
                     out.append(("symbol", "]"))
@@ -656,13 +660,13 @@ def _replace_globals(tokens: List[Tuple[str, str]], locals_set: Set[str],
         i += 1
     return out
 
-def _generate_lookup_table(global_map: Dict[str, int]) -> str:
+def _generate_lookup_table(lookup_name: str, global_map: Dict[str, int]) -> str:
     if not global_map:
         return ""
     parts = []
     for name, idx in global_map.items():
-        parts.append(f"_[{idx}]={name}")
-    return "local _G_LOOKUP = {}\n" + "\n".join(parts) + "\n"
+        parts.append(f"{lookup_name}[{idx}]={name}")
+    return f"local {lookup_name} = {{}}\n" + "\n".join(parts) + "\n"
 
 def _flatten_control_flow(code: str, used: Set[str]) -> str:
     state_var = _fresh(used)
@@ -726,8 +730,7 @@ class Obfuscation(commands.Cog):
         except ValueError as e:
             await interaction.followup.send(str(e), ephemeral=True)
         except Exception as e:
-            # Log the actual error for debugging
-            print(f"Obfuscation error: {e}")
+            print(f"Obfuscation error: {e}")  # Log to console
             await interaction.followup.send("Obfuscation failed. Check the file and try again.", ephemeral=True)
 
 async def setup(bot: commands.Bot):
