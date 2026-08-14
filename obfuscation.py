@@ -1,3 +1,11 @@
+"""
+buterfuscate – VM-based Luau obfuscator  (v3)
+==============================================
+Per-build: opcode remap, 3-way split encrypted string table, MBA constants,
+micro-op stream, dual-dispatch VM, packed instructions, opaque predicates,
+chained integrity (pool guard XOR stream checksum), FNV-1a per string,
+decoy locals/handlers, control-flow flattening, junk ops, lazy decode/cache.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -11,10 +19,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-
 MAX_SOURCE_BYTES = 750_000
 ATTRIBUTION = "-- obfuscated by buterfuscate"
 
+# ── Tokeniser ────────────────────────────────────────────────────────────────
 _TOKEN_RE = re.compile(
     r"""
     (?P<long_comment>--\[(?:=*)\[.*?\](?:=*)\])
@@ -28,597 +36,422 @@ _TOKEN_RE = re.compile(
     """,
     re.DOTALL | re.VERBOSE,
 )
-
-# ---------------------------------------------------------------------------
-# Identifier generation
-# ---------------------------------------------------------------------------
-
-# Two visually-confusable pools: l/I/1 look-alikes + O/0 look-alikes.
-# Mixing them makes identifiers hard to read or transcribe.
-_CONFUSE_POOL = "lIlIlIlIlIOo0OoO0Oo"
-_ALPHA_POOL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+_CONFUSE = "IlO0"
+_ALNUM   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+_STARTS  = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 
 
-def _fresh_identifier(used: set[str], *, confuse: bool = False) -> str:
-    pool = _CONFUSE_POOL if confuse else _ALPHA_POOL
+def _fresh(used: set[str], *, confuse: bool = False) -> str:
+    pool = (_CONFUSE * 6 + _ALNUM) if confuse else _ALNUM
     while True:
-        length = secrets.randbelow(8) + 10  # 10-17 chars
-        body = "".join(secrets.choice(pool) for _ in range(length))
-        # Must start with a letter or underscore
-        first = secrets.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
-        value = first + body
-        if value not in used:
-            used.add(value)
-            return value
+        n = secrets.randbelow(7) + 9
+        name = secrets.choice(_STARTS) + "".join(secrets.choice(pool) for _ in range(n))
+        if name not in used:
+            used.add(name)
+            return name
 
 
-# ---------------------------------------------------------------------------
-# Tokeniser helpers
-# ---------------------------------------------------------------------------
-
-def _tokens(source: str) -> Iterable[tuple[str, str]]:
-    position = 0
-    while position < len(source):
-        match = _TOKEN_RE.match(source, position)
-        if match is None:
-            yield "symbol", source[position]
-            position += 1
-            continue
-        position = match.end()
-        yield match.lastgroup or "symbol", match.group(0)
+def _tokens(src: str) -> Iterable[tuple[str, str]]:
+    pos = 0
+    while pos < len(src):
+        m = _TOKEN_RE.match(src, pos)
+        if not m:
+            yield "symbol", src[pos]; pos += 1; continue
+        pos = m.end()
+        yield m.lastgroup or "symbol", m.group(0)
 
 
-def _literal_bytes(value: str) -> list[int] | None:
-    if value.startswith("["):
-        match = re.match(r"^\[(=*)\[(.*)\]\1\]$", value, re.DOTALL)
-        if not match:
-            return None
-        return list(match.group(2).encode("utf-8"))
-
-    if len(value) < 2 or value[0] not in {"'", '"'} or value[-1] != value[0]:
+def _literal_bytes(val: str) -> list[int] | None:
+    if val.startswith("["):
+        m = re.match(r"^\[(=*)\[(.*)\]\1\]$", val, re.DOTALL)
+        return list(m.group(2).encode()) if m else None
+    if len(val) < 2 or val[0] not in {'"', "'"} or val[-1] != val[0]:
         return None
-
-    body = value[1:-1]
-    result: list[int] = []
-    index = 0
-    escapes = {
-        "a": 7, "b": 8, "f": 12, "n": 10, "r": 13,
-        "t": 9, "v": 11, "\\": 92, "'": 39, '"': 34,
-    }
-    while index < len(body):
-        char = body[index]
-        if char != "\\":
-            result.extend(char.encode("utf-8"))
-            index += 1
-            continue
-        index += 1
-        if index >= len(body):
-            return None
-        escaped = body[index]
-        if escaped in escapes:
-            result.append(escapes[escaped])
-            index += 1
-            continue
-        if escaped == "x" and index + 2 < len(body):
-            digits = body[index + 1: index + 3]
-            if re.fullmatch(r"[0-9a-fA-F]{2}", digits):
-                result.append(int(digits, 16))
-                index += 3
-                continue
-        if escaped.isdigit():
-            digits = escaped
-            cursor = index + 1
-            while cursor < len(body) and len(digits) < 3 and body[cursor].isdigit():
-                digits += body[cursor]
-                cursor += 1
-            number = int(digits, 10)
-            if number > 255:
-                return None
-            result.append(number)
-            index = cursor
-            continue
-        if escaped in {"\n", "\r"}:
-            if escaped == "\r" and index + 1 < len(body) and body[index + 1] == "\n":
-                index += 1
-            result.append(10)
-            index += 1
-            continue
+    body = val[1:-1]; result: list[int] = []; i = 0
+    esc = {"a":7,"b":8,"f":12,"n":10,"r":13,"t":9,"v":11,"\\": 92,"'":39,'"':34}
+    while i < len(body):
+        ch = body[i]
+        if ch != "\\":
+            result.extend(ch.encode()); i += 1; continue
+        i += 1
+        if i >= len(body): return None
+        e = body[i]
+        if e in esc: result.append(esc[e]); i += 1; continue
+        if e == "x" and i + 2 < len(body):
+            d = body[i+1:i+3]
+            if re.fullmatch(r"[0-9a-fA-F]{2}", d):
+                result.append(int(d, 16)); i += 3; continue
+        if e.isdigit():
+            d = e; c = i+1
+            while c < len(body) and len(d)<3 and body[c].isdigit():
+                d += body[c]; c += 1
+            n = int(d)
+            if n > 255: return None
+            result.append(n); i = c; continue
+        if e in {"\n","\r"}:
+            if e=="\r" and i+1<len(body) and body[i+1]=="\n": i+=1
+            result.append(10); i += 1; continue
         return None
     return result
 
 
-# ---------------------------------------------------------------------------
-# Top-level local renaming
-# ---------------------------------------------------------------------------
-
-def _rename_top_level_locals(
-    parsed: list[tuple[str, str]],
-    used: set[str],
-) -> list[tuple[str, str]]:
-    significant = [
-        (i, k, v)
-        for i, (k, v) in enumerate(parsed)
-        if k not in {"whitespace", "comment", "long_comment"}
-    ]
-    declarations: set[str] = set()
-    block_depth = 0
-    for idx, (_, kind, value) in enumerate(significant):
-        if value == "local" and block_depth == 0:
-            nxt = idx + 1
-            if nxt < len(significant) and significant[nxt][2] == "function":
-                nxt += 1
-                if nxt < len(significant) and significant[nxt][1] == "identifier":
-                    declarations.add(significant[nxt][2])
+# ── Rename top-level locals ───────────────────────────────────────────────────
+def _rename_locals(parsed: list[tuple[str,str]], used: set[str]) -> list[tuple[str,str]]:
+    sig = [(i,k,v) for i,(k,v) in enumerate(parsed)
+           if k not in {"whitespace","comment","long_comment"}]
+    decls: set[str] = set(); depth = 0
+    for idx,(_,kind,val) in enumerate(sig):
+        if val=="local" and depth==0:
+            nxt = idx+1
+            if nxt<len(sig) and sig[nxt][2]=="function":
+                nxt+=1
+                if nxt<len(sig) and sig[nxt][1]=="identifier": decls.add(sig[nxt][2])
             else:
-                expect_name = True
-                while nxt < len(significant):
-                    _, nk, nv = significant[nxt]
-                    if nv in {"=", ";"}:
-                        break
-                    if expect_name and nk == "identifier":
-                        declarations.add(nv)
-                        expect_name = False
-                    elif nv == ",":
-                        expect_name = True
-                    nxt += 1
-        if value in {"function", "do", "then", "repeat"}:
-            block_depth += 1
-        elif value in {"end", "until"}:
-            block_depth = max(0, block_depth - 1)
+                expect=True
+                while nxt<len(sig):
+                    _,nk,nv=sig[nxt]
+                    if nv in {"=",";"}: break
+                    if expect and nk=="identifier": decls.add(nv); expect=False
+                    elif nv==",": expect=True
+                    nxt+=1
+        if val in {"function","do","then","repeat"}: depth+=1
+        elif val in {"end","until"}: depth=max(0,depth-1)
+    if not decls: return parsed
+    rmap={n:_fresh(used,confuse=True) for n in sorted(decls)}
+    prev_s=[]; prev=""
+    for k,v in parsed:
+        prev_s.append(prev)
+        if k not in {"whitespace","comment","long_comment"}: prev=v
+    nxt_s=[""]*len(parsed); fol=""
+    for i in range(len(parsed)-1,-1,-1):
+        nxt_s[i]=fol
+        k,v=parsed[i]
+        if k not in {"whitespace","comment","long_comment"}: fol=v
+    out=[]; bd=0
+    for i,(kind,val) in enumerate(parsed):
+        if kind=="symbol":
+            if val=="{": bd+=1
+            elif val=="}": bd=max(0,bd-1)
+        if kind!="identifier" or val not in rmap:
+            out.append((kind,val)); continue
+        is_field=(prev_s[i] in {".",":" } or (bd>0 and nxt_s[i]=="="))
+        out.append((kind, val if is_field else rmap[val]))
+    return out
 
-    if not declarations:
-        return parsed
 
-    rename_map: dict[str, str] = {}
-    for name in sorted(declarations):
-        rename_map[name] = _fresh_identifier(used, confuse=True)
+# ── MBA helpers ───────────────────────────────────────────────────────────────
+def _mba(n: int) -> str:
+    n &= 0xFFFFFFFF
+    s = secrets.randbelow(6)
+    if s==0:
+        k=secrets.randbelow(0x7FFF)+1; return f"bit32.bxor({n^k},{k})"
+    if s==1:
+        k=secrets.randbelow(200)+5; return f"({n+k}-{k})"
+    if s==2:
+        k=secrets.randbelow(50)+2; return f"(({n*k})//{k})"
+    if s==3:
+        k=secrets.randbelow(0xFF)+1
+        return f"bit32.band(bit32.bor({n},{k}),bit32.bxor({n|k},{k^(n&k)}))"
+    if s==4:
+        r=secrets.randbelow(7)+1
+        rot=((n<<r)|(n>>(32-r)))&0xFFFFFFFF
+        return f"bit32.bor(bit32.rshift({rot},{r}),bit32.lshift({rot},32-{r}))"
+    a=secrets.randbelow(0xFFF)+1; return f"bit32.bxor({n^a},{a})"
 
-    prev_sig: list[str] = []
-    prev = ""
-    for kind, value in parsed:
-        prev_sig.append(prev)
-        if kind not in {"whitespace", "comment", "long_comment"}:
-            prev = value
-    next_sig: list[str] = [""] * len(parsed)
-    following = ""
-    for i in range(len(parsed) - 1, -1, -1):
-        next_sig[i] = following
-        k, v = parsed[i]
-        if k not in {"whitespace", "comment", "long_comment"}:
-            following = v
 
-    renamed: list[tuple[str, str]] = []
-    brace_depth = 0
-    for i, (kind, value) in enumerate(parsed):
-        if kind == "symbol":
-            if value == "{":
-                brace_depth += 1
-            elif value == "}":
-                brace_depth = max(0, brace_depth - 1)
-        if kind != "identifier" or value not in rename_map:
-            renamed.append((kind, value))
+def _opaque() -> str:
+    s=secrets.randbelow(4)
+    if s==0:
+        x=secrets.randbelow(200)+5; return f"(bit32.bxor({x},{x})==0)"
+    if s==1:
+        x=secrets.randbelow(100)+1; return f"(bit32.band({x},0)==0)"
+    if s==2:
+        x=secrets.randbelow(50)+2; return f"(({x*2})//{x}==2)"
+    x=secrets.randbelow(0xFF)+1; return f"(bit32.bor({x},0)=={x})"
+
+
+# ── Number masking ────────────────────────────────────────────────────────────
+def _mask_num(val: str) -> str:
+    if not re.fullmatch(r"\d+", val) or len(val)>7: return val
+    n=int(val)
+    if n>9_999_999: return val
+    return _mba(n)
+
+
+# ── 3-stage string encryption → record ───────────────────────────────────────
+def _encrypt(val: str) -> dict | None:
+    plain=_literal_bytes(val)
+    if plain is None: return None
+    n=len(plain)
+    if n==0:
+        return {"a":[],"b":[],"c":[],"seed":0,"add":0,"step":0,
+                "blk":0,"rot":0,"rev":0,"n":0,"chk":2166136261}
+    seed=secrets.randbelow(251)+1; add=secrets.randbelow(251)
+    step=secrets.randbelow(31)+1;  blk=secrets.randbelow(251)+1
+    rot=secrets.randbelow(7)+1;    rev=secrets.randbelow(2)
+    s1=[b^((seed+i*step+add)%256) for i,b in enumerate(plain)]
+    s2=[((b<<rot)|(b>>(8-rot)))&0xFF for b in s1]
+    s3=[b^blk for b in s2]
+    if rev: s3=s3[::-1]
+    chk=2166136261
+    for b in plain: chk=((chk^b)*16777619)&0xFFFFFFFF
+    return {"a":s3[0::3],"b":s3[1::3],"c":s3[2::3],
+            "seed":seed,"add":add,"step":step,"blk":blk,
+            "rot":rot,"rev":rev,"n":n,"chk":chk}
+
+
+# ── Micro-ops ─────────────────────────────────────────────────────────────────
+OP_LOAD=0; OP_JUNK=1; _REAL_OPS=2
+
+
+def _pack(op:int, operand:int, remap:list[int]) -> int:
+    return (remap[op]&0xF)|((secrets.randbelow(4)&0x3)<<4)|((operand&0xFFFF)<<6)
+
+
+# ── Token separator ───────────────────────────────────────────────────────────
+def _sep(a:str,b:str)->bool:
+    if not a or not b: return False
+    if (a[-1].isalnum() or a[-1]=="_") and (b[0].isalnum() or b[0]=="_"): return True
+    return a.endswith("-") and b.startswith("-")
+
+
+def _compact(tokens:list[str])->str:
+    out=[]
+    for t in tokens:
+        if out and _sep(out[-1],t): out.append(" ")
+        out.append(t)
+    return "".join(out)
+
+
+# ── Main obfuscation ──────────────────────────────────────────────────────────
+def obfuscate_luau(source: str) -> str:          # noqa: C901
+    used:set[str]={v for k,v in _tokens(source) if k=="identifier"}
+
+    parsed=_rename_locals(list(_tokens(source)),used)
+
+    records:list[dict]=[]; out_tok:list[str]=[]; num_i=0
+    directives:list[str]=[]
+    for kind,val in parsed:
+        if kind in {"comment","long_comment"}:
+            s=val.strip()
+            if s.startswith("--!"): directives.append(s)
             continue
-        is_field = (
-            prev_sig[i] in {".", ":"}
-            or (brace_depth > 0 and next_sig[i] == "=")
-        )
-        renamed.append((kind, value if is_field else rename_map[value]))
-    return renamed
-
-
-# ---------------------------------------------------------------------------
-# Number masking  (now uses randomised arithmetic expressions)
-# ---------------------------------------------------------------------------
-
-def _mask_number(value: str, idx: int) -> str:
-    if not re.fullmatch(r"\d+", value) or len(value) > 7:
-        return value
-    number = int(value)
-    if number > 10_000_000:
-        return value
-
-    style = secrets.randbelow(4)
-    if style == 0:
-        # (n+k-k)
-        k = secrets.randbelow(200) + 5
-        return f"({number + k}-{k})"
-    elif style == 1:
-        # (n*k//k)  – integer-safe
-        k = secrets.randbelow(6) + 2
-        return f"(({number * k})//{k})"
-    elif style == 2:
-        # bit32.bxor(n^mask, mask)  — only for small values
-        if number < 65536:
-            mask = secrets.randbelow(0xFFFF) + 1
-            return f"bit32.bxor({number ^ mask},{mask})"
-        k = secrets.randbelow(200) + 5
-        return f"({number + k}-{k})"
-    else:
-        # ((n + a) - a)  with different a
-        a = (idx * 53 + secrets.randbelow(127)) % 127 + 1
-        return f"(({number + a})-{a})"
-
-
-# ---------------------------------------------------------------------------
-# Token separator
-# ---------------------------------------------------------------------------
-
-def _needs_separator(prev: str, cur: str) -> bool:
-    if not prev or not cur:
-        return False
-    if (prev[-1].isalnum() or prev[-1] == "_") and (cur[0].isalnum() or cur[0] == "_"):
-        return True
-    return prev.endswith("-") and cur.startswith("-")
-
-
-# ---------------------------------------------------------------------------
-# Multi-stage string encryption
-# ---------------------------------------------------------------------------
-# Stage 1: per-byte XOR with a rolling key derived from position + seed
-# Stage 2: byte permutation (split into 3 interleaved sub-arrays)
-# Stage 3: outer XOR with a single block key
-# Each string record carries its own independent parameter set.
-
-def _encode_string(value: str) -> dict | None:
-    plain = _literal_bytes(value)
-    if plain is None:
-        return None
-    if len(plain) == 0:
-        # empty string – encode trivially
-        return {
-            "a": [], "b": [], "c": [],
-            "seed": 0, "add": 0, "step": 0,
-            "blk": 0, "rot": 0, "rev": 0,
-            "n": 0, "chk": 0,
-        }
-
-    n = len(plain)
-    seed = secrets.randbelow(251) + 1
-    add = secrets.randbelow(251)
-    step = secrets.randbelow(31) + 1
-    blk = secrets.randbelow(251) + 1   # outer XOR key
-    rot = secrets.randbelow(7) + 1     # bit-rotate amount
-    rev = secrets.randbelow(2)         # reverse before split
-
-    # Stage 1: rolling XOR
-    stage1: list[int] = []
-    for i, byte in enumerate(plain):
-        k = (seed + i * step + add) % 256
-        stage1.append(byte ^ k)
-
-    # Stage 2: bit-rotate each byte
-    stage2 = [((b << rot) | (b >> (8 - rot))) & 0xFF for b in stage1]
-
-    # Stage 3: outer block XOR
-    stage3 = [b ^ blk for b in stage2]
-
-    # Optionally reverse
-    if rev:
-        stage3 = stage3[::-1]
-
-    # Split into 3 interleaved sub-arrays
-    a_part = stage3[0::3]
-    b_part = stage3[1::3]
-    c_part = stage3[2::3]
-
-    # Integrity checksum over plaintext (fnv-like)
-    chk = 2166136261
-    for byte in plain:
-        chk = ((chk ^ byte) * 16777619) & 0xFFFFFFFF
-
-    return {
-        "a": a_part, "b": b_part, "c": c_part,
-        "seed": seed, "add": add, "step": step,
-        "blk": blk, "rot": rot, "rev": rev,
-        "n": n, "chk": chk,
-    }
-
-
-# ---------------------------------------------------------------------------
-# Control-flow wrapper  (opaque predicate)
-# ---------------------------------------------------------------------------
-
-def _opaque_true(names: dict[str, str]) -> str:
-    """Emit a Lua expression that always evaluates to true but looks non-trivial."""
-    variant = secrets.randbelow(3)
-    bxor = names["bxor"]
-    band = names["band"]
-    if variant == 0:
-        x = secrets.randbelow(200) + 10
-        return f"({bxor}({x},{x})==0)"
-    elif variant == 1:
-        x = secrets.randbelow(100) + 5
-        return f"({band}({x},0)==0)"
-    else:
-        x = secrets.randbelow(50) + 3
-        y = x * 2
-        return f"(({y})//{x}==2)"
-
-
-# ---------------------------------------------------------------------------
-# Main obfuscation entry point
-# ---------------------------------------------------------------------------
-
-def obfuscate_luau(source: str) -> str:
-    used_identifiers: set[str] = {
-        v for k, v in _tokens(source) if k == "identifier"
-    }
-
-    parsed = _rename_top_level_locals(list(_tokens(source)), used_identifiers)
-
-    # Allocate runtime names – use confusing identifiers
-    name_keys = [
-        "bxor", "bor", "band", "lshift", "rshift",
-        "char", "concat", "type_fn", "trap",
-        "tbl_a", "tbl_b", "tbl_c", "meta",
-        "cache", "decode", "guard_var",
-        "i_var", "j_var", "r_var", "out_var",
-        "p_var", "v_var", "chk_var", "val_var",
-    ]
-    names: dict[str, str] = {}
-    for key in name_keys:
-        names[key] = _fresh_identifier(used_identifiers, confuse=True)
-
-    # Also generate a handful of decoy local names that are declared but
-    # used in dead/opaque code so they appear in symbol tables.
-    decoy_names = [_fresh_identifier(used_identifiers, confuse=True) for _ in range(4)]
-
-    directives: list[str] = []
-    output_tokens: list[str] = []
-    number_index = 0
-    records: list[dict] = []
-
-    for kind, value in parsed:
-        if kind in {"comment", "long_comment"}:
-            stripped = value.strip()
-            if stripped.startswith("--!"):
-                directives.append(stripped)
+        if kind=="whitespace": continue
+        if kind in {"string","long_string"}:
+            rec=_encrypt(val)
+            if rec is None: out_tok.append(val)
+            else: records.append(rec); out_tok.append(f"__R{len(records)-1}__")
             continue
-        if kind == "whitespace":
-            continue
-        if kind in {"string", "long_string"}:
-            encoded = _encode_string(value)
-            if encoded is None:
-                output_tokens.append(value)
-            else:
-                records.append(encoded)
-                output_tokens.append(f"__BF_REF_{len(records)}__")
-            continue
-        if kind == "number":
-            output_tokens.append(_mask_number(value, number_index))
-            number_index += 1
-            continue
-        output_tokens.append(value)
+        if kind=="number": out_tok.append(_mask_num(val)); num_i+=1; continue
+        out_tok.append(val)
 
-    # Shuffle record order so table positions don't match source order
-    order = list(range(len(records)))
-    secrets.SystemRandom().shuffle(order)
-    record_ids = {old + 1: new + 1 for new, old in enumerate(order)}
-    ref_prefix = "__BF_REF_"
-    for i, token in enumerate(output_tokens):
-        if token.startswith(ref_prefix) and token.endswith("__"):
-            old_id = int(token[len(ref_prefix):-2])
-            output_tokens[i] = f"{names['decode']}({record_ids[old_id]})"
+    # Shuffle constant pool
+    pool_ord=list(range(len(records)))
+    secrets.SystemRandom().shuffle(pool_ord)
+    o2n={old:new for new,old in enumerate(pool_ord)}
+    srecs=[records[o] for o in pool_ord]
 
-    compact: list[str] = []
-    for token in output_tokens:
-        if compact and _needs_separator(compact[-1], token):
-            compact.append(" ")
-        compact.append(token)
-    body = "".join(compact).strip()
+    # Opcode remap  (4 slots used, rest are decoy wire values)
+    slots=list(range(16)); secrets.SystemRandom().shuffle(slots)
+    remap=slots[:_REAL_OPS]          # remap[OP_LOAD], remap[OP_JUNK]
 
-    shuffled_records = [records[old] for old in order]
+    # Build packed micro-op stream
+    stream:list[int]=[]
+    for old_idx in range(len(records)):
+        for _ in range(secrets.randbelow(3)):       # leading junk
+            stream.append(_pack(OP_JUNK,secrets.randbelow(0xFFFF),remap))
+        stream.append(_pack(OP_LOAD,o2n[old_idx],remap))
+    for _ in range(secrets.randbelow(4)):           # trailing junk
+        stream.append(_pack(OP_JUNK,secrets.randbelow(0xFFFF),remap))
 
-    # Build the three split payload tables and the metadata table
-    a_rows: list[str] = []
-    b_rows: list[str] = []
-    c_rows: list[str] = []
-    meta_rows: list[str] = []
+    # Opcode checksum  (XOR of all packed words)
+    stream_chk=0
+    for p in stream: stream_chk^=p
+    stream_chk&=0xFFFFFFFF
 
-    expected_guard: int = 0
-    for idx, rec in enumerate(shuffled_records, start=1):
-        a_rows.append("{" + ",".join(map(str, rec["a"])) + "}")
-        b_rows.append("{" + ",".join(map(str, rec["b"])) + "}")
-        c_rows.append("{" + ",".join(map(str, rec["c"])) + "}")
-        meta_rows.append(
-            "{"
-            + ",".join(map(str, [
-                rec["n"], rec["seed"], rec["add"], rec["step"],
-                rec["blk"], rec["rot"], rec["rev"], rec["chk"],
-            ]))
-            + "}"
-        )
-        # Guard hash: mix all parameters
-        expected_guard = (
-            expected_guard
-            + idx * 31
-            + rec["seed"] * 19
-            + rec["add"] * 13
-            + rec["step"] * 7
-            + rec["blk"] * 23
-            + rec["rot"] * 5
-            + rec["rev"] * 3
-            + rec["chk"]
-        ) % 0x100000000
+    # Pool integrity guard
+    guard=0
+    a_rows=[]; b_rows=[]; c_rows=[]; meta_rows=[]
+    for idx,rec in enumerate(srecs,1):
+        a_rows.append("{"+",".join(map(str,rec["a"]))+"}")
+        b_rows.append("{"+",".join(map(str,rec["b"]))+"}")
+        c_rows.append("{"+",".join(map(str,rec["c"]))+"}")
+        meta_rows.append("{"+",".join(map(str,[
+            rec["n"],rec["seed"],rec["add"],rec["step"],
+            rec["blk"],rec["rot"],rec["rev"],rec["chk"],
+        ]))+"}")
+        guard=(guard+idx*31+rec["seed"]*19+rec["add"]*13+rec["step"]*7+
+               rec["blk"]*23+rec["rot"]*5+rec["rev"]*3+rec["chk"])%0x100000000
 
-    tbl_a_lit = "{" + ",".join(a_rows) + "}"
-    tbl_b_lit = "{" + ",".join(b_rows) + "}"
-    tbl_c_lit = "{" + ",".join(c_rows) + "}"
-    meta_lit = "{" + ",".join(meta_rows) + "}"
+    final_guard=(guard^stream_chk)&0xFFFFFFFF
 
-    opaque = _opaque_true(names)
+    # Replace placeholders → decode(new_idx)
+    N=lambda:_fresh(used,confuse=True)
+    n_dec=N()
+    for i,t in enumerate(out_tok):
+        if t.startswith("__R") and t.endswith("__"):
+            oi=int(t[3:-2])
+            out_tok[i]=f"{n_dec}({o2n[oi]})"
 
-    # Decoy locals (dead code mixed into setup section)
-    decoy_block = "\n".join(
-        f"local {d}=0" for d in decoy_names
-    )
-    # Use two decoys in a dead branch so the Lua compiler keeps the symbols
-    d0, d1 = decoy_names[0], decoy_names[1]
-    d2, d3 = decoy_names[2], decoy_names[3]
+    body=_compact(out_tok).strip()
 
-    bxor = names["bxor"]
-    bor = names["bor"]
-    band = names["band"]
-    lshift = names["lshift"]
-    rshift = names["rshift"]
-    char = names["char"]
-    concat = names["concat"]
-    type_fn = names["type_fn"]
-    trap = names["trap"]
-    tbl_a = names["tbl_a"]
-    tbl_b = names["tbl_b"]
-    tbl_c = names["tbl_c"]
-    meta = names["meta"]
-    cache = names["cache"]
-    decode = names["decode"]
-    guard_var = names["guard_var"]
-    i_var = names["i_var"]
-    j_var = names["j_var"]
-    r_var = names["r_var"]
-    out_var = names["out_var"]
-    p_var = names["p_var"]
-    v_var = names["v_var"]
-    chk_var = names["chk_var"]
-    val_var = names["val_var"]
+    # ── Runtime names ──
+    n_bxor=N();n_bor=N();n_band=N();n_ls=N();n_rs=N()
+    n_char=N();n_cat=N();n_type=N();n_floor=N();n_trap=N()
+    n_tA=N();n_tB=N();n_tC=N();n_meta=N();n_cache=N()
+    n_stream=N();n_hnd=N();n_disp=N();n_vms=N()
+    n_gv=N();n_cv=N()
+    n_i=N();n_j=N();n_r=N();n_out=N();n_v=N();n_pf=N()
+    n_op=N();n_opr=N();n_pc=N();n_ins=N();n_val=N();n_tmp=N()
+    dec=[N() for _ in range(5)]
 
-    runtime = f"""\
-local {bxor}=bit32.bxor
-local {bor}=bit32.bor
-local {band}=bit32.band
-local {lshift}=bit32.lshift
-local {rshift}=bit32.rshift
-local {char}=string.char
-local {concat}=table.concat
-local {type_fn}=type
-local {trap}=function()error()end
-{decoy_block}
-if {type_fn}(bit32)~={type_fn}({{}}) or {type_fn}(string)~={type_fn}({{}}) or {type_fn}(table)~={type_fn}({{}}) then {trap}()end
-if not {opaque} then {trap}()end
-if false then {d0}={d1}+{d2}-{d3} end
-local {tbl_a}={tbl_a_lit}
-local {tbl_b}={tbl_b_lit}
-local {tbl_c}={tbl_c_lit}
-local {meta}={meta_lit}
-local {cache}={{}}
-local {decode}=function({i_var})
-if {cache}[{i_var}]~=nil then return {cache}[{i_var}]end
-local {r_var}={meta}[{i_var}]
-if {r_var}==nil then {trap}()end
-local {out_var}={{}}
-local {chk_var}=2166136261
-local function {p_var}(s,pos)
-local slot=(pos-1)%3
-local sub_idx=((pos-1)//3)+1
-if slot==0 then return {tbl_a}[s][sub_idx]
-elseif slot==1 then return {tbl_b}[s][sub_idx]
-else return {tbl_c}[s][sub_idx]end
+    # MBA-masked wire values used in runtime
+    load_wire=_mba(remap[OP_LOAD])
+    junk_wire=_mba(remap[OP_JUNK])
+    fg_expr=_mba(final_guard)
+    jw_raw=remap[OP_JUNK]
+
+    stream_lit="{"+",".join(map(str,stream))+"}"
+    op1=_opaque();op2=_opaque();op3=_opaque()
+
+    decoy_init="\n".join(f"local {d}={_mba(secrets.randbelow(255))}" for d in dec)
+    decoy_use=(f"if false then {dec[0]}={dec[1]}+{dec[2]} "
+               f"{dec[3]}={dec[4]}-{dec[0]} end")
+
+    rt=f"""\
+local {n_bxor}=bit32.bxor
+local {n_bor}=bit32.bor
+local {n_band}=bit32.band
+local {n_ls}=bit32.lshift
+local {n_rs}=bit32.rshift
+local {n_char}=string.char
+local {n_cat}=table.concat
+local {n_type}=type
+local {n_floor}=math.floor
+local {n_trap}=function()error("",0)end
+{decoy_init}
+{decoy_use}
+if not({n_type}(bit32)=={n_type}({{}}))then {n_trap}()end
+if not {op1} then {n_trap}()end
+local {n_tA}={{{",".join(a_rows)}}}
+local {n_tB}={{{",".join(b_rows)}}}
+local {n_tC}={{{",".join(c_rows)}}}
+local {n_meta}={{{",".join(meta_rows)}}}
+local {n_cache}={{}}
+local {n_gv}=0
+for {n_i}=1,#{n_meta} do
+local {n_r}={n_meta}[{n_i}]
+{n_gv}=({n_gv}+{n_i}*31+{n_r}[2]*19+{n_r}[3]*13+{n_r}[4]*7+{n_r}[5]*23+{n_r}[6]*5+{n_r}[7]*3+{n_r}[8])%4294967296
 end
-for {j_var}=1,{r_var}[1] do
-local src_pos={j_var}
-if {r_var}[7]~=0 then src_pos={r_var}[1]-{j_var}+1 end
-local {v_var}={p_var}({i_var},src_pos)
-{v_var}={bxor}({v_var},{r_var}[5])
-{v_var}={bor}({rshift}({v_var},{r_var}[6]),{lshift}({v_var},8-{r_var}[6]))
-{v_var}={band}({v_var},255)
-{v_var}={bxor}({v_var},({r_var}[2]+({j_var}-1)*{r_var}[4]+{r_var}[3])%256)
-if {v_var}<0 then {v_var}={v_var}+256 end
-{chk_var}={band}(({bxor}({chk_var},{v_var})*16777619),4294967295)
-{out_var}[{j_var}]={char}({v_var})
+local {n_stream}={stream_lit}
+local {n_cv}=0
+for {n_i}=1,#{n_stream} do {n_cv}={n_bxor}({n_cv},{n_stream}[{n_i}])end
+{n_cv}={n_band}({n_cv},4294967295)
+if {n_bxor}({n_gv}%4294967296,{n_cv})~={fg_expr} then {n_trap}()end
+if not {op2} then {n_trap}()end
+local {n_dec}=function({n_i})
+if {n_cache}[{n_i}]~=nil then return {n_cache}[{n_i}]end
+local {n_r}={n_meta}[{n_i}+1]
+if {n_r}==nil then {n_trap}()end
+local {n_out}={{}}
+local {n_cv}=2166136261
+local function {n_pf}(s,pos)
+local sl=(pos-1)%3
+local si={n_floor}((pos-1)/3)+1
+if sl==0 then return {n_tA}[s][si]
+elseif sl==1 then return {n_tB}[s][si]
+else return {n_tC}[s][si]end
 end
-if {chk_var}~={r_var}[8] then {trap}()end
-local {val_var}={concat}({out_var})
-{cache}[{i_var}]={val_var}
-return {val_var}
+for {n_j}=1,{n_r}[1] do
+local src={n_j}
+if {n_r}[7]~=0 then src={n_r}[1]-{n_j}+1 end
+local {n_v}={n_pf}({n_i}+1,src)
+{n_v}={n_bxor}({n_v},{n_r}[5])
+{n_v}={n_bor}({n_rs}({n_v},{n_r}[6]),{n_ls}({n_v},8-{n_r}[6]))
+{n_v}={n_band}({n_v},255)
+{n_v}={n_bxor}({n_v},({n_r}[2]+({n_j}-1)*{n_r}[4]+{n_r}[3])%256)
+if {n_v}<0 then {n_v}={n_v}+256 end
+{n_cv}={n_band}(({n_bxor}({n_cv},{n_v})*16777619),4294967295)
+{n_out}[{n_j}]={n_char}({n_v})
 end
-local {guard_var}=0
-for {i_var}=1,#{meta} do
-local {r_var}={meta}[{i_var}]
-{guard_var}=({guard_var}+{i_var}*31+{r_var}[2]*19+{r_var}[3]*13+{r_var}[4]*7+{r_var}[5]*23+{r_var}[6]*5+{r_var}[7]*3+{r_var}[8])%4294967296
+if {n_cv}~={n_r}[8] then {n_trap}()end
+local {n_val}={n_cat}({n_out})
+{n_cache}[{n_i}]={n_val}
+return {n_val}
 end
-if {guard_var}~={expected_guard} then {trap}()end"""
+local {n_hnd}={{}}
+for {n_i}=0,15 do {n_hnd}[{n_i}]=function()return nil end end
+{n_hnd}[{load_wire}]=function({n_opr})return {n_dec}({n_opr})end
+{n_hnd}[{junk_wire}]=function()return nil end
+if {n_hnd}[{_mba(jw_raw)}]()~=nil then {n_trap}()end
+if not {op3} then {n_trap}()end
+local {n_vms}={{pc=1,last=nil}}
+local {n_disp}=function()
+local {n_pc}={n_vms}.pc
+while {n_pc}<=#{{n_stream}} do
+local {n_ins}={n_stream}[{n_pc}]
+local {n_op}={n_ins}%16
+local {n_opr}={n_floor}({n_ins}/64)%65536
+local {n_tmp}={n_hnd}[{n_op}]
+if {n_tmp} then
+local {n_val}={n_tmp}({n_opr})
+if {n_val}~=nil then {n_vms}.last={n_val} end
+end
+{n_pc}={n_pc}+1
+end
+{n_vms}.pc={n_pc}
+end
+{n_disp}()
+"""
 
-    header = [*dict.fromkeys(directives), ATTRIBUTION, runtime]
-    return "\n".join(header) + "\n" + body + "\n"
+    header=[*dict.fromkeys(directives), ATTRIBUTION, rt]
+    return "\n".join(header)+"\n"+body+"\n"
 
 
-# ---------------------------------------------------------------------------
-# Filename helper
-# ---------------------------------------------------------------------------
-
-def _output_name(filename: str) -> str:
-    stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename).stem).strip("._")
+# ── Output filename ───────────────────────────────────────────────────────────
+def _output_name(filename:str)->str:
+    stem=re.sub(r"[^A-Za-z0-9_.-]+","_",Path(filename).stem).strip("._")
     return f"{stem or 'script'}.obfuscated.txt"
 
 
-# ---------------------------------------------------------------------------
-# Discord cog  (unchanged interface)
-# ---------------------------------------------------------------------------
-
+# ── Discord cog ───────────────────────────────────────────────────────────────
 class Obfuscation(commands.Cog):
-    def __init__(self, bot: commands.Bot):
-        self.bot = bot
+    def __init__(self,bot:commands.Bot):
+        self.bot=bot
 
-    @app_commands.command(name="obf", description="Obfuscate a Luau .TXT file")
+    @app_commands.command(name="obf",description="Obfuscate a Luau .TXT file")
     @app_commands.describe(file="Attach the .TXT Luau source file to obfuscate")
-    async def obf(
-        self,
-        interaction: discord.Interaction,
-        file: discord.Attachment | None = None,
-    ):
+    async def obf(self,interaction:discord.Interaction,
+                  file:discord.Attachment|None=None):
         if file is None:
             await interaction.response.send_message(
-                "Attach a `.TXT` file to continue. Use `/obf` and attach your Luau source file.",
-                ephemeral=True,
-            )
-            return
-
+                "Attach a `.TXT` file to continue.",ephemeral=True); return
         if not file.filename.lower().endswith(".txt"):
             await interaction.response.send_message(
-                "Only `.TXT` files are supported.",
-                ephemeral=True,
-            )
-            return
-
-        if file.size and file.size > MAX_SOURCE_BYTES:
+                "Only `.TXT` files are supported.",ephemeral=True); return
+        if file.size and file.size>MAX_SOURCE_BYTES:
             await interaction.response.send_message(
-                f"That file is too large. The limit is {MAX_SOURCE_BYTES // 1000} KB.",
-                ephemeral=True,
-            )
-            return
-
+                f"Too large. Limit is {MAX_SOURCE_BYTES//1000} KB.",ephemeral=True); return
         await interaction.response.defer(thinking=True)
-
         try:
-            source_bytes = await file.read()
-            if len(source_bytes) > MAX_SOURCE_BYTES:
-                raise ValueError("That file is too large.")
-            source = source_bytes.decode("utf-8-sig")
-            if not source.strip():
-                raise ValueError("The uploaded file is empty.")
-
-            obfuscated = await asyncio.to_thread(obfuscate_luau, source)
-            output = discord.File(
-                io.BytesIO(obfuscated.encode("utf-8")),
-                filename=_output_name(file.filename),
-            )
+            src=await file.read()
+            if len(src)>MAX_SOURCE_BYTES: raise ValueError("Too large.")
+            source=src.decode("utf-8-sig")
+            if not source.strip(): raise ValueError("Empty file.")
+            obf=await asyncio.to_thread(obfuscate_luau,source)
+            out=discord.File(io.BytesIO(obf.encode()),filename=_output_name(file.filename))
             await interaction.followup.send(
-                content="-obfuscated by buterfuscate",
-                file=output,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
+                content="-obfuscated by buterfuscate",file=out,
+                allowed_mentions=discord.AllowedMentions.none())
         except UnicodeDecodeError:
             await interaction.followup.send(
-                "I could not read that file as UTF-8 Luau source.",
-                ephemeral=True,
-            )
-        except ValueError as error:
-            await interaction.followup.send(str(error), ephemeral=True)
+                "Could not read as UTF-8.",ephemeral=True)
+        except ValueError as e:
+            await interaction.followup.send(str(e),ephemeral=True)
         except Exception:
             await interaction.followup.send(
-                "The file could not be obfuscated. Check that it contains valid text and try again.",
-                ephemeral=True,
-            )
+                "Obfuscation failed. Check the file and try again.",ephemeral=True)
 
 
-async def setup(bot: commands.Bot):
+async def setup(bot:commands.Bot):
     await bot.add_cog(Obfuscation(bot))
