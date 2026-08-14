@@ -1,5 +1,3 @@
-# ── Full obfuscate_luau (v6) – includes VariableRenamer ──────────────────
-
 from __future__ import annotations
 
 import asyncio
@@ -9,7 +7,7 @@ import secrets
 import random
 import base64
 from pathlib import Path
-from typing import Iterable, Set, Dict, Tuple, List, Any, Optional
+from typing import Iterable, Set, Dict, Tuple, List, Any
 
 import discord
 from discord import app_commands
@@ -26,7 +24,7 @@ except ImportError:
 MAX_SOURCE_BYTES = 750_000
 ATTRIBUTION = "-- obfuscated by buterfuscate v6"
 
-# ── Tokeniser (used for fallback and some helpers) ────────────────────────
+# ── Tokeniser ──────────────────────────────────────────────────────────────
 _TOKEN_RE = re.compile(
     r"""
     (?P<long_comment>--\[(?:=*)\[.*?\](?:=*)\])
@@ -166,6 +164,48 @@ def _compact(tokens:list[str])->str:
         out.append(t)
     return "".join(out)
 
+def _rename_locals(parsed: list[tuple[str,str]], used: set[str]) -> list[tuple[str,str]]:
+    sig = [(i,k,v) for i,(k,v) in enumerate(parsed)
+           if k not in {"whitespace","comment","long_comment"}]
+    decls: set[str] = set(); depth = 0
+    for idx,(_,kind,val) in enumerate(sig):
+        if val=="local" and depth==0:
+            nxt = idx+1
+            if nxt<len(sig) and sig[nxt][2]=="function":
+                nxt+=1
+                if nxt<len(sig) and sig[nxt][1]=="identifier": decls.add(sig[nxt][2])
+            else:
+                expect=True
+                while nxt<len(sig):
+                    _,nk,nv=sig[nxt]
+                    if nv in {"=",";"}: break
+                    if expect and nk=="identifier": decls.add(nv); expect=False
+                    elif nv==",": expect=True
+                    nxt+=1
+        if val in {"function","do","then","repeat"}: depth+=1
+        elif val in {"end","until"}: depth=max(0,depth-1)
+    if not decls: return parsed
+    rmap={n:_fresh(used,confuse=True) for n in sorted(decls)}
+    prev_s=[]; prev=""
+    for k,v in parsed:
+        prev_s.append(prev)
+        if k not in {"whitespace","comment","long_comment"}: prev=v
+    nxt_s=[""]*len(parsed); fol=""
+    for i in range(len(parsed)-1,-1,-1):
+        nxt_s[i]=fol
+        k,v=parsed[i]
+        if k not in {"whitespace","comment","long_comment"}: fol=v
+    out=[]; bd=0
+    for i,(kind,val) in enumerate(parsed):
+        if kind=="symbol":
+            if val=="{": bd+=1
+            elif val=="}": bd=max(0,bd-1)
+        if kind!="identifier" or val not in rmap:
+            out.append((kind,val)); continue
+        is_field=(prev_s[i] in {".",":" } or (bd>0 and nxt_s[i]=="="))
+        out.append((kind, val if is_field else rmap[val]))
+    return out
+
 def _output_name(filename: str) -> str:
     stem=re.sub(r"[^A-Za-z0-9_.-]+","_",Path(filename).stem).strip("._")
     return f"{stem or 'script'}.obfuscated.txt"
@@ -236,7 +276,7 @@ class StringEncrypter:
         code = "".join(local_table) + new_source
         return code, self.str_decryptor
 
-# ── MathEncrypter (AST‑based) ─────────────────────────────────────────────────
+# ── MathEncrypter ─────────────────────────────────────────────────────────────
 class MathEncrypter:
     def __init__(self, source: str, int_key: int):
         self.source = source
@@ -261,11 +301,7 @@ class MathEncrypter:
         new_source = _compact([v for k, v in new_tokens])
         return new_source, self.decrypt
 
-# ── VariableRenamer (Python port of the Lua module) ──────────────────────────
-# This replaces local variables and built‑in function names with random aliases,
-# while protecting strings, comments, table keys, and dot/colon property accesses.
-
-# List of built‑in functions to be renamed (Lua 5.1 + Luau subset)
+# ── VariableRenamer (safe, token‑based) ──────────────────────────────────────
 BUILTINS = [
     "assert", "collectgarbage", "dofile", "error", "ipairs", "next",
     "pairs", "pcall", "print", "rawequal", "rawget", "rawlen", "rawset",
@@ -286,320 +322,85 @@ BUILTINS = [
     "os.tmpname",
 ]
 
-RESERVED = {
-    "and","break","do","else","elseif","end","false","for","function",
-    "goto","if","in","local","nil","not","or","repeat","return","then",
-    "true","until","while",
-}
-
 def _rename_variables(code: str, target: str = "luau") -> str:
-    """
-    Rename local variables and built‑in functions to random names,
-    protecting strings, comments, table keys, and dot/colon accesses.
-    """
-    # Step 1: parse local variable declarations
-    local_vars = set()
-    pos = 1
-    while pos <= len(code):
-        ch = code[pos-1]
-        # skip strings
-        if ch == '"' or ch == "'" or (ch == "[" and pos < len(code) and code[pos] == "["):
-            end = _skip_string(code, pos)
-            pos = end
-            continue
-        # skip comments
-        if ch == "-" and pos < len(code) and code[pos] == "-":
-            end = _skip_comment(code, pos)
-            pos = end
-            continue
-        # match "local"
-        if code.startswith("local", pos-1):
-            # ensure it's a whole word
-            if (pos == 1 or not code[pos-2].isalnum() and code[pos-2] != "_") and \
-               (pos+4 >= len(code) or not code[pos+4].isalnum() and code[pos+4] != "_"):
-                # find variable names
-                start = pos + 5  # after "local"
-                # skip whitespace
-                while start <= len(code) and code[start-1].isspace():
-                    start += 1
-                # find the end of the declaration (until '=', ';', newline, or end of statement)
-                # we need to extract comma‑separated names
-                decl_part = ""
-                depth = 0
-                i = start
-                while i <= len(code):
-                    c = code[i-1]
-                    if c == "(":
-                        depth += 1
-                    elif c == ")":
-                        depth -= 1
-                    elif c == "[":
-                        depth += 1
-                    elif c == "]":
-                        depth -= 1
-                    elif c == "=" and depth == 0:
-                        break
-                    elif c == "\n" and depth == 0:
-                        break
-                    elif c == ";" and depth == 0:
-                        break
-                    # if target == "luau" and c == ":" and depth == 0:
-                    #     # skip type annotation
-                    #     # we'll handle by not adding colon token
-                    #     pass
-                    else:
-                        decl_part += c
-                    i += 1
-                # extract identifiers from decl_part (skip 'function' and params)
-                if decl_part.strip().startswith("function"):
-                    # local function name
-                    m = re.match(r"^function\s+([a-zA-Z_][a-zA-Z0-9_]*)", decl_part.strip())
-                    if m:
-                        local_vars.add(m.group(1))
-                else:
-                    # comma‑separated identifiers
-                    for name in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", decl_part):
-                        if name not in RESERVED:
-                            local_vars.add(name)
-                pos = i
-                continue
-        pos += 1
-
-    # Step 2: filter builtins for target
-    builtins = list(BUILTINS)
-    if target == "luau":
-        # Luau: 'type' is a keyword for type aliases, not a function
-        builtins = [b for b in builtins if b != "type"]
-    # also remove "string.dump" for Luau
-    if target == "luau":
-        builtins = [b for b in builtins if b != "string.dump"]
-
-    # Step 3: generate rename maps
-    used_names = set()
-    for v in local_vars:
-        used_names.add(v)
-    for b in builtins:
-        simple = b.split(".")[-1]
-        used_names.add(simple)
-
-    def gen_name():
-        while True:
-            length = random.randint(8, 12)
-            name = "".join(random.choice("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ") for _ in range(length))
-            if name not in used_names and name not in RESERVED:
-                used_names.add(name)
-                return name
-
-    local_rename = {v: gen_name() for v in local_vars}
-    builtin_rename = {}
-    used_builtins = []
-    for b in builtins:
-        if b in code:
-            new = gen_name()
-            builtin_rename[b] = new
-            used_builtins.append((b, new))
-
-    # Step 4: apply replacements with protection for strings, comments, table keys, dot/colon
-    # Use placeholder technique: replace protected sections with unique placeholders,
-    # then apply renames, then restore.
-
-    # First, collect all protected segments: strings, comments, dot/colon property accesses, table keys
-    # We'll do a character‑by‑character scan with context.
-
-    # We'll implement a simplified but robust scanner that builds a list of (pos, end, type) segments
-    # and replaces them with placeholders.
-
-    # To keep code manageable, we'll reuse the tokenizer and the existing _rename_locals logic
-    # which already avoids renaming fields. The main addition is builtin renaming.
-    # So we'll keep the existing local renaming (which already protects fields) and add builtin
-    # renaming using a separate pass that only replaces whole‑word occurrences that are not part
-    # of protected contexts.
-
-    # However, to be thorough, we'll implement a full protection using the tokenizer.
-    # We'll parse tokens with context (field access indicator) and replace identifiers accordingly.
-
-    # We'll use the tokenizer to get tokens, but we need to know if an identifier is a field
-    # (preceded by '.' or ':' or inside table key position) to skip renaming.
-    # Our existing _rename_locals does this, but we want to also rename builtins.
-
-    # Approach: run the existing local renaming first (which renames locals and protects fields),
-    # then do a global search‑and‑replace for builtins, but only replace occurrences that are
-    # not part of string/comment and not part of a field access. Since the local renaming
-    # already produces code with renamed locals, we can then scan the result for builtin names
-    # and replace them with their aliases, ensuring we don't break anything.
-
-    # This is simpler: we'll do:
-    # 1. Use _rename_locals (existing) to rename locals (already protects fields).
-    # 2. Build a set of used identifiers that are locals (already renamed) and reserved words.
-    # 3. Scan the code token‑by‑token, and for each identifier that matches a builtin name,
-    #    replace it with the alias if it's not part of a field access (i.e., not preceded by '.' or ':').
-
-    # But we also need to add local alias declarations for builtins.
-
-    # Let's implement that.
-
-    # First, rename locals using the existing function.
+    # Step 1: rename locals using existing robust function
     used = set()
-    parsed = list(_tokens(code))
-    parsed_renamed = _rename_locals(parsed, used)  # this also updates used
+    tokens = list(_tokens(code))
+    tokens_renamed = _rename_locals(tokens, used)
+    code_renamed = _compact([v for k, v in tokens_renamed])
 
-    # Now we have renamed tokens. Build a new code string.
-    code_renamed = _compact([v for k, v in parsed_renamed])
+    # Step 2: find builtins used as non‑field identifiers
+    builtin_simple_names = {b.split(".")[-1] for b in BUILTINS}
+    if target == "luau":
+        builtin_simple_names.discard("type")   # 'type' is a keyword in Luau
+        # Also remove string.dump if not present
+        builtin_simple_names.discard("dump")   # safe
 
-    # Now, detect builtins used and create aliases.
-    # We'll scan tokens again after renaming, but we need to know which identifiers are builtins.
-    # We'll create a mapping of builtin simple names to aliases.
-    builtin_alias = {}
-    for b in builtins:
-        simple = b.split(".")[-1]
-        # check if the simple name appears as an identifier in the code (not part of string/comment)
-        # We'll scan tokens.
-        # Since we already have tokens from parsed_renamed, we can check each identifier.
-        # We'll collect used builtin names.
-        builtin_names_used = set()
-        for kind, val in parsed_renamed:
-            if kind == "identifier" and val == simple:
-                # but we need to ensure it's not a field access (preceded by '.' or ':')
-                # We can check using context from the token list.
-                # We'll do a more thorough check by scanning the code with a function that identifies
-                # if an identifier is a field access.
-                # For simplicity, we'll use the tokenizer and the same logic as _rename_locals
-                # to determine field status.
-                # We'll just add all occurrences; we'll replace them with alias later.
-                builtin_names_used.add(simple)
-        # also check the full dot notation like "math.abs" if present
-        if b in code_renamed:
-            # we'll add the full name mapping as well
-            builtin_alias[b] = gen_name()
-        # For the simple name, we need to map it to the same alias if the builtin is used.
-        # But if multiple builtins share the same simple name? e.g., string.sub and math.sub? There is no conflict.
-        # We'll generate a mapping per simple name.
-        if simple in builtin_names_used:
-            if simple not in builtin_alias:
-                builtin_alias[simple] = gen_name()
-
-    # Now we need to replace occurrences of builtin names in the code with their aliases,
-    # but only when they are not field accesses (i.e., not preceded by '.' or ':').
-    # We'll use the token list with context.
-    # We'll rebuild the output tokens, replacing identifiers that are builtins and not fields.
-    # We'll also need to add local alias declarations for builtins that are used.
-    # We'll collect which builtins are actually used (by checking if the simple name appears as a non‑field identifier).
-
-    # Re‑scan parsed_renamed with context to know field status.
-    # We'll use the same logic as _rename_locals: track brace depth and previous symbol.
-    prev_s = [""] * len(parsed_renamed)
+    # Compute context for tokens_renamed (field detection)
+    prev_s = [""] * len(tokens_renamed)
     prev = ""
-    for i, (kind, val) in enumerate(parsed_renamed):
+    for i, (kind, val) in enumerate(tokens_renamed):
         prev_s[i] = prev
         if kind not in {"whitespace","comment","long_comment"}:
             prev = val
-    nxt_s = [""] * len(parsed_renamed)
+    nxt_s = [""] * len(tokens_renamed)
     fol = ""
-    for i in range(len(parsed_renamed)-1, -1, -1):
+    for i in range(len(tokens_renamed)-1, -1, -1):
         nxt_s[i] = fol
-        kind, val = parsed_renamed[i]
+        kind, val = tokens_renamed[i]
         if kind not in {"whitespace","comment","long_comment"}:
             fol = val
     bd = 0
-    output_tokens = []
-    for i, (kind, val) in enumerate(parsed_renamed):
+    builtin_used = set()
+    for i, (kind, val) in enumerate(tokens_renamed):
         if kind == "symbol":
             if val == "{":
                 bd += 1
             elif val == "}":
                 bd = max(0, bd-1)
         if kind == "identifier":
-            # Check if it's a field: preceded by '.' or ':' or (inside table key: bd>0 and next token is '=')
+            is_field = (prev_s[i] in {".", ":"}) or (bd > 0 and nxt_s[i] == "=")
+            if not is_field and val in builtin_simple_names:
+                builtin_used.add(val)
+
+    if not builtin_used:
+        return code_renamed
+
+    # Step 3: generate aliases (avoid name conflicts)
+    used_names = set(used)  # contains all renamed locals
+    builtin_alias = {}
+    for name in builtin_used:
+        new_name = _fresh(used_names, confuse=True)
+        builtin_alias[name] = new_name
+
+    # Step 4: replace builtin identifiers in tokens_renamed (with context)
+    output_tokens = []
+    for i, (kind, val) in enumerate(tokens_renamed):
+        if kind == "identifier":
             is_field = (prev_s[i] in {".", ":"}) or (bd > 0 and nxt_s[i] == "=")
             if not is_field and val in builtin_alias:
                 output_tokens.append(("identifier", builtin_alias[val]))
                 continue
         output_tokens.append((kind, val))
-
-    # Rebuild code
     final_code = _compact([v for k, v in output_tokens])
 
-    # Prepend local alias declarations for builtins that were used
-    used_builtin_aliases = {}
-    for b, alias in builtin_alias.items():
-        # if the simple name appears in final_code as a non‑field identifier, then we need to declare it.
-        # But we already replaced, so we can check if alias appears in final_code.
-        if alias in final_code:
-            # we need to map the full builtin path to the alias
-            # but we might have replaced both simple and full names; we need to ensure we declare for each.
-            # We'll check if the original builtin name (full) is used, or if the simple name is used.
-            # We'll declare for each distinct alias.
-            used_builtin_aliases[alias] = b  # b is the full name or simple name
-
-    if used_builtin_aliases:
-        decl_parts = []
-        assign_parts = []
-        for alias, original in used_builtin_aliases.items():
-            decl_parts.append(alias)
-            assign_parts.append(f"{alias}={original}")
-        declaration = "local " + ",".join(decl_parts) + "\n" + ";".join(assign_parts) + ";\n"
-        final_code = declaration + final_code
+    # Step 5: prepend local declarations for aliases
+    decl_parts = []
+    assign_parts = []
+    for alias, original in builtin_alias.items():
+        decl_parts.append(alias)
+        assign_parts.append(f"{alias}={original}")
+    declaration = "local " + ",".join(decl_parts) + "\n" + ";".join(assign_parts) + ";\n"
+    final_code = declaration + final_code
 
     return final_code
-
-# Helper functions for skipping strings and comments (for potential future use)
-def _skip_string(code: str, pos: int) -> int:
-    if pos > len(code): return pos
-    ch = code[pos-1]
-    if ch == '"' or ch == "'":
-        q = ch
-        i = pos
-        while i <= len(code):
-            c = code[i-1]
-            if c == "\\":
-                i += 2
-            elif c == q:
-                return i
-            else:
-                i += 1
-        return i
-    elif ch == "[" and pos < len(code) and code[pos] == "[":
-        # find matching ]] with same number of =
-        eq_count = 0
-        i = pos + 1
-        while i <= len(code) and code[i-1] == "=":
-            eq_count += 1
-            i += 1
-        if i <= len(code) and code[i-1] == "[":
-            close_str = "]" + "=" * eq_count + "]"
-            end = code.find(close_str, i)
-            if end != -1:
-                return end + len(close_str)
-    return pos
-
-def _skip_comment(code: str, pos: int) -> int:
-    if pos > len(code): return pos
-    if code.startswith("--", pos-1):
-        if pos+1 <= len(code) and code[pos] == "[":
-            # long comment
-            eq_count = 0
-            i = pos + 1
-            while i <= len(code) and code[i-1] == "=":
-                eq_count += 1
-                i += 1
-            if i <= len(code) and code[i-1] == "[":
-                close_str = "]" + "=" * eq_count + "]"
-                end = code.find(close_str, i)
-                if end != -1:
-                    # include trailing newline
-                    nl = code.find("\n", end)
-                    return nl + 1 if nl != -1 else len(code) + 1
-        # line comment
-        nl = code.find("\n", pos)
-        return nl + 1 if nl != -1 else len(code) + 1
-    return pos
 
 # ── Main obfuscation ──────────────────────────────────────────────────────────
 def obfuscate_luau(source: str) -> str:
     # Step 1: Variable Renamer (locals and builtins)
     source = _rename_variables(source, target="luau")
 
-    # Step 2: String and Number encryption (using AST if available)
+    # Step 2: String and Number encryption
     str_key = secrets.randbelow(256) + 1
     int_key = secrets.randbelow(256) + 1
     str_enc = StringEncrypter(source, str_key)
@@ -608,7 +409,7 @@ def obfuscate_luau(source: str) -> str:
     source, int_decryptor = math_enc.apply()
     decryptor_code = str_decryptor + "\n" + int_decryptor
 
-    # Step 3: Build global map for hiding function calls (replaces builtins with lookup)
+    # Step 3: Build global map for hiding function calls
     used: Set[str] = {v for k, v in _tokens(source) if k == "identifier"}
     parsed = _rename_locals(list(_tokens(source)), used)
     # Recompute locals after rename
@@ -924,7 +725,9 @@ class Obfuscation(commands.Cog):
             await interaction.followup.send("Could not read as UTF-8.", ephemeral=True)
         except ValueError as e:
             await interaction.followup.send(str(e), ephemeral=True)
-        except Exception:
+        except Exception as e:
+            # Log the actual error for debugging
+            print(f"Obfuscation error: {e}")
             await interaction.followup.send("Obfuscation failed. Check the file and try again.", ephemeral=True)
 
 async def setup(bot: commands.Bot):
