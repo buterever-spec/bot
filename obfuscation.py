@@ -5,11 +5,10 @@ import io
 import re
 import secrets
 import random
-import base64
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Iterable, Set, Dict, Tuple, List, Any, Optional
+from typing import List, Set, Dict, Tuple, Optional
 
 import discord
 from discord import app_commands
@@ -19,11 +18,11 @@ from discord.ext import commands
 # CONFIG
 # -----------------------------------------------------------------------------
 MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate v15"
+ATTRIBUTION = "-- obfuscated by buterfuscate v16"
 OBFUSCATION_LEVEL = "MAX"
 
 # -----------------------------------------------------------------------------
-# SHORT IDENTIFIERS (Luraph style)
+# SHORT IDENTIFIERS
 # -----------------------------------------------------------------------------
 _CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
@@ -56,7 +55,7 @@ def _compact(tokens: list[str]) -> str:
     return "".join(out)
 
 # -----------------------------------------------------------------------------
-# ROBUST TOKENIZER (for renaming and minification)
+# ROBUST TOKENIZER
 # -----------------------------------------------------------------------------
 class TokenKind:
     WHITESPACE = "whitespace"; COMMENT = "comment"; LONG_COMMENT = "long_comment"
@@ -223,7 +222,7 @@ def _rename_locals(code: str) -> str:
     tokens = Scanner(code).scan()
     root = _build_scopes(tokens)
     builtins = {"print","warn","error","require","pairs","ipairs","next","typeof","Instance",
-                "bit32","string","table","math","os","debug","_G","_ENV","getfenv","_VERSION"}
+                "string","table","math","os","debug","_G","_ENV","getfenv","_VERSION"}
     used = set(builtins)
     def assign(sc, used_set):
         for name in list(sc.names):
@@ -250,7 +249,7 @@ def _rename_locals(code: str) -> str:
                     out.append(t.value); resolved = True; break
             if not resolved: out.append(t.value)
         else: out.append(t.value)
-    return " ".join(out)  # will be compacted later
+    return " ".join(out)
 
 # -----------------------------------------------------------------------------
 # INTEGER OBFUSCATION (hex + MBA)
@@ -267,13 +266,13 @@ def _mask_int(n: int) -> str:
         return f"(({hex(n*k)})//{hex(k)})"
     elif r == 2:
         k = secrets.randbelow(0xFFFF) + 1
-        return f"bit32.bxor({hex(n^k)},{hex(k)})"
+        return f"({hex(n^k)}~{hex(k)})"
     elif r == 3:
         k = secrets.randbelow(0xFF) + 1
-        return f"bit32.band(bit32.bor({hex(n)},{hex(k)}),bit32.bxor({hex(n|k)},{hex(k^(n&k))}))"
+        return f"(({hex(n)}&{hex(k)})|({hex(n|k)}~{hex(k^(n&k))}))"
     else:
         a = secrets.randbelow(0xFFF) + 1
-        return f"bit32.bxor({hex(n^a)},{hex(a)})"
+        return f"({hex(n^a)}~{hex(a)})"
 
 # -----------------------------------------------------------------------------
 # STRING ENCRYPTION (variable split, rev, exact length)
@@ -282,7 +281,6 @@ def _pack_meta(split, seed, add, step, blk, rot, rev):
     return (split & 0xF) | ((seed & 0xFF) << 4) | ((add & 0xFF) << 12) | ((step & 0x1F) << 20) | ((blk & 0xFF) << 25) | ((rot & 0x7) << 33) | ((rev & 0x1) << 36)
 
 def _encrypt_string(plain: str, seed: int) -> dict:
-    # plain must be a string literal (with quotes or brackets)
     bytes_ = _literal_bytes(plain)
     if bytes_ is None:
         raise ValueError(f"Invalid string literal: {plain}")
@@ -304,23 +302,23 @@ def _encrypt_string(plain: str, seed: int) -> dict:
     return {"chunks": chunks, "meta": meta, "chk": chk, "len": n}
 
 # -----------------------------------------------------------------------------
-# DECODER + LOADSTRING RUNTIME GENERATOR
+# DECODER + LOADSTRING RUNTIME GENERATOR (native bitwise ops)
 # -----------------------------------------------------------------------------
 def generate_runtime(record: dict, used: set) -> str:
-    """Generate a runtime that decodes one payload and executes it via loadstring."""
     N = lambda: _fresh(used, confuse=False)
-    bxor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
+    # Short names for locals
+    xor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
     char, concat, floor = N(), N(), N()
     trap, meta_tbl, chunk_tbl, len_tbl, chk_tbl, cache, decode_fn = N(), N(), N(), N(), N(), N(), N()
 
-    # Single record
     meta = [str(hex(record["meta"]))]
     chunk_strs = ["{" + ",".join(hex(b) for b in ch) + "}" for ch in record["chunks"]]
     chunks = ["{" + ",".join(chunk_strs) + "}"]
     lens = [str(hex(record["len"]))]
     chks = [str(hex(record["chk"]))]
 
-    runtime = f"""local {bxor},{bor},{band},{lshift},{rshift}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
+    # Using native operators: ~ for xor, | for or, & for and, << and >> for shifts.
+    runtime = f"""local {xor},{bor},{band},{lshift},{rshift}=function(a,b)return a~b end,function(a,b)return a|b end,function(a,b)return a&b end,function(a,b)return a<<b end,function(a,b)return a>>b end
 local {char},{concat},{floor}=string.char,table.concat,math.floor
 local {trap}=function()error("",0)end
 local {meta_tbl}={{{",".join(meta)}}}
@@ -351,12 +349,12 @@ local bi=(i-1)//split+1
 local b=chunk[bi]
 if not b then {trap}() end
 local v=b
-v={bxor}(v,blk)
+v={xor}(v,blk)
 v={bor}({rshift}(v,rot),{lshift}(v,0x8-rot))
 v={band}(v,0xFF)
-v={bxor}(v,(seed+(i-1)*step+add)%0x100)
+v={xor}(v,(seed+(i-1)*step+add)%0x100)
 if v<0 then v=v+0x100 end
-chk={band}(({bxor}(chk,v)*0x1000193),0xFFFFFFFF)
+chk={band}(({xor}(chk,v)*0x1000193),0xFFFFFFFF)
 local pos=i
 if rev==1 then pos=n-i+1 end
 out[pos]={char}(v)
@@ -395,23 +393,18 @@ def _validate(code: str) -> bool:
 # MAIN OBFUSCATOR
 # -----------------------------------------------------------------------------
 def obfuscate_luau(source: str) -> str:
-    # 1. Rename locals (optional, but makes source less readable if extracted)
-    code = _rename_locals(source)
+    # 1. (Optional) Rename locals to make source less readable if extracted.
+    source = _rename_locals(source)
 
-    # 2. Minify the source: remove comments, whitespace, compact (but keep it as a string)
-    # We'll get the raw source as a string, then we'll wrap it in a long string literal.
-    # We need to properly escape it if it contains brackets. We'll use a long bracket with many = signs.
-    # Determine a bracket level that doesn't appear in the source.
-    max_eq = 0
-    # Simple: use [=[ ... ]=] with increasing = until no match.
+    # 2. Determine a long bracket level that doesn't appear in the source.
     eq = 0
     while True:
         open_bracket = "[%s[" % ("=" * eq)
         close_bracket = "]%s]" % ("=" * eq)
-        if open_bracket not in code and close_bracket not in code:
+        if open_bracket not in source and close_bracket not in source:
             break
         eq += 1
-    source_literal = "[%s[%s]%s]" % ("=" * eq, code, "=" * eq)
+    source_literal = "[%s[%s]%s]" % ("=" * eq, source, "=" * eq)
 
     # 3. Encrypt the whole source as a single string
     seed = secrets.randbelow(0xFFFFFFFF)
