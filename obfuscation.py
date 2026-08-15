@@ -48,9 +48,7 @@ def random_name(used: Set[str], length: int = 0) -> str:
             return name
 
 def minify_lua(code: str) -> str:
-    # Remove comments and extra whitespace safely
     code = re.sub(r'--\[\[.*?\]\]|--[^\n]*', '', code, flags=re.DOTALL)
-    # Collapse multiple spaces but keep single spaces where needed
     code = re.sub(r'\s+', ' ', code).strip()
     return code
 
@@ -66,10 +64,6 @@ class Layer:
         return data
 
     @staticmethod
-    def xor_key_inv(data: bytearray, key: int) -> bytearray:
-        return Layer.xor_key(data, key)  # self-inverse
-
-    @staticmethod
     def rotate_left(data: bytearray, rot: int) -> bytearray:
         for i in range(len(data)):
             data[i] = ((data[i] << rot) | (data[i] >> (8 - rot))) & 0xFF
@@ -77,7 +71,6 @@ class Layer:
 
     @staticmethod
     def rotate_left_inv(data: bytearray, rot: int) -> bytearray:
-        # rotate right
         for i in range(len(data)):
             data[i] = ((data[i] >> rot) | (data[i] << (8 - rot))) & 0xFF
         return data
@@ -101,10 +94,6 @@ class Layer:
         return data
 
     @staticmethod
-    def xor_sequence_inv(data: bytearray, keys: List[int]) -> bytearray:
-        return Layer.xor_sequence(data, keys)  # self-inverse
-
-    @staticmethod
     def stream_cipher(data: bytearray, seed: int, stream_a: int, stream_b: int) -> bytearray:
         state = (seed ^ stream_a) & 0xFFFFFFFF
         for i in range(len(data)):
@@ -112,11 +101,6 @@ class Layer:
             data[i] ^= (state >> 16) & 0xFF
             data[i] ^= (i * stream_b + (seed & 0xFF)) & 0xFF
         return data
-
-    @staticmethod
-    def stream_cipher_inv(data: bytearray, seed: int, stream_a: int, stream_b: int) -> bytearray:
-        # Same operation (self-inverse)
-        return Layer.stream_cipher(data, seed, stream_a, stream_b)
 
 # -----------------------------------------------------------------------------
 # 3. ENCRYPTION WITH RANDOMIZED LAYER ORDER
@@ -132,10 +116,11 @@ class CryptoParams:
         self.stream_a = random.randint(1000, 99999)
         self.stream_b = random.randint(1000, 99999)
         self.integrity_seed = random.randint(1, 0xFFFFFFFF)
+        self.layer_order = []
 
 def encrypt_payload(payload: bytes, params: CryptoParams) -> bytes:
     data = bytearray(payload)
-    # Apply layers in random order
+    # Build list of layers with (name, args, function)
     layers = [
         ('xor_key', params.layer1_key, Layer.xor_key),
         ('rotate_left', params.layer2_rot, Layer.rotate_left),
@@ -144,21 +129,7 @@ def encrypt_payload(payload: bytes, params: CryptoParams) -> bytes:
         ('stream_cipher', (params.seed, params.stream_a, params.stream_b), Layer.stream_cipher),
     ]
     random.shuffle(layers)
-    # Store the layer order in metadata for decryption
-    order = [name for name, _, _ in layers]
-    for _, _, func in layers:
-        if isinstance(func, tuple):
-            # For stream_cipher, the third element is the function, the second is args tuple
-            # Actually we structured as (name, args, func) but we'll adjust.
-        # Let's simplify: we'll just store the list of layer names and parameters in params.
-    # For simplicity, we'll just store the order and parameters separately.
-    # We'll store the order as a list of layer names and the parameters in a table.
-    # But for this version, we'll just apply layers in a fixed order but randomize parameters.
-    # To get variation, we'll randomize the parameters per build, and also randomize the order of applying layers.
-    # Since the user wants variation, we'll randomize the order by shuffling the layer list and storing the order.
-
-    # We'll store the order in the metadata as a string of layer names.
-    # We'll encode the order as numbers.
+    # Store order
     layer_map = {
         'xor_key': 1,
         'rotate_left': 2,
@@ -166,23 +137,14 @@ def encrypt_payload(payload: bytes, params: CryptoParams) -> bytes:
         'xor_sequence': 4,
         'stream_cipher': 5,
     }
-    order_nums = [layer_map[name] for name, _, _ in layers]
-    params.layer_order = order_nums
-
+    params.layer_order = [layer_map[name] for name, _, _ in layers]
     # Apply layers
     for name, args, func in layers:
-        if name == 'xor_key':
-            data = func(data, args)
-        elif name == 'rotate_left':
-            data = func(data, args)
-        elif name == 'add_const':
-            data = func(data, args)
-        elif name == 'xor_sequence':
-            data = func(data, args)
-        elif name == 'stream_cipher':
+        if name == 'stream_cipher':
             seed, sa, sb = args
             data = func(data, seed, sa, sb)
-
+        else:
+            data = func(data, args)
     return bytes(data)
 
 # -----------------------------------------------------------------------------
@@ -210,7 +172,6 @@ class DecoderGenerator:
         data_tbl_def = f"local {data_tbl}={{{data_str}}}"
 
         # Metadata: store all parameters and layer order
-        # layer_order is a table of numbers (1‑based)
         order_str = "{" + ",".join(map(str, layer_order)) + "}"
         xor_keys_str = "{" + ",".join(map(str, params.layer4_keys)) + "}"
         meta_entry = "{" + ",".join([
@@ -226,15 +187,8 @@ class DecoderGenerator:
         ]) + "}"
         meta_str = "{" + meta_entry + "}"
 
-        # We'll generate the decoder function that applies the inverse layers in reverse order.
-        # The layer_order is the forward order; the reverse order is the reversed list.
-        # We'll generate Lua code that reads the order from metadata and applies the inverse functions accordingly.
-        # To avoid a giant switch statement, we'll generate a sequence of if-else if blocks based on the order.
-        # Since the order is known at generation time, we can directly emit the inverse operations in the correct order.
-
-        # Build the inverse layer code as a string
+        # Build the inverse layer code
         inv_code = []
-        # Reverse the order
         rev_order = layer_order[::-1]
         for layer_num in rev_order:
             if layer_num == 1:  # xor_key
