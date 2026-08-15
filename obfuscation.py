@@ -19,7 +19,7 @@ from discord.ext import commands
 # CONFIG
 # -----------------------------------------------------------------------------
 MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate v14"
+ATTRIBUTION = "-- obfuscated by buterfuscate v15"
 OBFUSCATION_LEVEL = "MAX"
 
 # -----------------------------------------------------------------------------
@@ -56,7 +56,7 @@ def _compact(tokens: list[str]) -> str:
     return "".join(out)
 
 # -----------------------------------------------------------------------------
-# ROBUST TOKENIZER
+# ROBUST TOKENIZER (for renaming and minification)
 # -----------------------------------------------------------------------------
 class TokenKind:
     WHITESPACE = "whitespace"; COMMENT = "comment"; LONG_COMMENT = "long_comment"
@@ -154,7 +154,7 @@ class Scanner:
         self.tokens.append(Token(TokenKind.SYMBOL, self.source[start:self.pos], self.line, self.col))
 
 # -----------------------------------------------------------------------------
-# LITERAL BYTES
+# LITERAL BYTES (for encryption)
 # -----------------------------------------------------------------------------
 def _literal_bytes(val: str) -> list[int] | None:
     if val.startswith("["):
@@ -304,63 +304,29 @@ def _encrypt_string(plain: str, seed: int) -> dict:
     return {"chunks": chunks, "meta": meta, "chk": chk, "len": n}
 
 # -----------------------------------------------------------------------------
-# GLOBAL REPLACEMENT (hide global function names)
+# DECODER + LOADSTRING RUNTIME GENERATOR
 # -----------------------------------------------------------------------------
-def _replace_globals(tokens: List[Token], global_map: Dict[str, int], lookup_name: str) -> List[Token]:
-    out = []
-    i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t.kind == TokenKind.IDENTIFIER and t.value in global_map:
-            # check if it's a function call (next non-whitespace is '(')
-            j = i + 1
-            while j < len(tokens) and tokens[j].kind == TokenKind.WHITESPACE:
-                j += 1
-            if j < len(tokens) and tokens[j].value == '(':
-                # ensure not preceded by '.' or ':' (method call)
-                if i > 0 and tokens[i-1].value not in ('.', ':'):
-                    # replace with lookup_name[decode(idx)]
-                    idx = global_map[t.value]
-                    out.append(Token(TokenKind.IDENTIFIER, lookup_name, t.line, t.col))
-                    out.append(Token(TokenKind.SYMBOL, "[", t.line, t.col))
-                    out.append(Token(TokenKind.IDENTIFIER, f"__G{idx}__", t.line, t.col))
-                    out.append(Token(TokenKind.SYMBOL, "]", t.line, t.col))
-                    i += 1
-                    continue
-        out.append(t)
-        i += 1
-    return out
-
-# -----------------------------------------------------------------------------
-# RUNTIME GENERATOR
-# -----------------------------------------------------------------------------
-def generate_runtime(records: List[dict], used: set, global_map: Dict[str, int]) -> Tuple[str, str]:
-    """Returns (runtime_code, decode_function_name, global_lookup_name)"""
+def generate_runtime(record: dict, used: set) -> str:
+    """Generate a runtime that decodes one payload and executes it via loadstring."""
     N = lambda: _fresh(used, confuse=False)
     bxor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
     char, concat, floor = N(), N(), N()
     trap, meta_tbl, chunk_tbl, len_tbl, chk_tbl, cache, decode_fn = N(), N(), N(), N(), N(), N(), N()
 
-    meta_list = [str(hex(r["meta"])) for r in records]
-    chunk_list = []
-    for r in records:
-        chunk_strs = ["{" + ",".join(hex(b) for b in ch) + "}" for ch in r["chunks"]]
-        chunk_list.append("{" + ",".join(chunk_strs) + "}")
-    len_list = [str(hex(r["len"])) for r in records]
-    chk_list = [str(hex(r["chk"])) for r in records]
+    # Single record
+    meta = [str(hex(record["meta"]))]
+    chunk_strs = ["{" + ",".join(hex(b) for b in ch) + "}" for ch in record["chunks"]]
+    chunks = ["{" + ",".join(chunk_strs) + "}"]
+    lens = [str(hex(record["len"]))]
+    chks = [str(hex(record["chk"]))]
 
-    # Global lookup table – will be used as G[decoded_name]
-    lookup_name = N()
-    env_decl = f"local {lookup_name}=getfenv and getfenv(0) or _G or _ENV\n"
-
-    body = f"""local {bxor},{bor},{band},{lshift},{rshift}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
+    runtime = f"""local {bxor},{bor},{band},{lshift},{rshift}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
 local {char},{concat},{floor}=string.char,table.concat,math.floor
 local {trap}=function()error("",0)end
-{env_decl}
-local {meta_tbl}={{{",".join(meta_list)}}}
-local {chunk_tbl}={{{",".join(chunk_list)}}}
-local {len_tbl}={{{",".join(len_list)}}}
-local {chk_tbl}={{{",".join(chk_list)}}}
+local {meta_tbl}={{{",".join(meta)}}}
+local {chunk_tbl}={{{",".join(chunks)}}}
+local {len_tbl}={{{",".join(lens)}}}
+local {chk_tbl}={{{",".join(chks)}}}
 local {cache}={{}}
 local function {decode_fn}(idx)
 if {cache}[idx] then return {cache}[idx] end
@@ -399,8 +365,12 @@ if chk~=expected then {trap}() end
 local result={concat}(out)
 {cache}[idx]=result
 return result
-end"""
-    return body, decode_fn, lookup_name
+end
+local payload={decode_fn}(0)
+local fn, err=loadstring(payload)
+if not fn then error(err,0) end
+fn()"""
+    return runtime
 
 # -----------------------------------------------------------------------------
 # MINIFICATION (one line)
@@ -425,116 +395,37 @@ def _validate(code: str) -> bool:
 # MAIN OBFUSCATOR
 # -----------------------------------------------------------------------------
 def obfuscate_luau(source: str) -> str:
-    # 1. Rename locals
+    # 1. Rename locals (optional, but makes source less readable if extracted)
     code = _rename_locals(source)
 
-    # 2. Tokenize
-    tokens = Scanner(code).scan()
+    # 2. Minify the source: remove comments, whitespace, compact (but keep it as a string)
+    # We'll get the raw source as a string, then we'll wrap it in a long string literal.
+    # We need to properly escape it if it contains brackets. We'll use a long bracket with many = signs.
+    # Determine a bracket level that doesn't appear in the source.
+    max_eq = 0
+    # Simple: use [=[ ... ]=] with increasing = until no match.
+    eq = 0
+    while True:
+        open_bracket = "[%s[" % ("=" * eq)
+        close_bracket = "]%s]" % ("=" * eq)
+        if open_bracket not in code and close_bracket not in code:
+            break
+        eq += 1
+    source_literal = "[%s[%s]%s]" % ("=" * eq, code, "=" * eq)
 
-    # 3. Build global map (identifiers not in local scopes)
-    root = _build_scopes(tokens)
-    def is_local(name, sc):
-        if name in sc.names: return True
-        for child in sc.children:
-            if is_local(name, child): return True
-        return False
+    # 3. Encrypt the whole source as a single string
+    seed = secrets.randbelow(0xFFFFFFFF)
+    encrypted = _encrypt_string(source_literal, seed)
 
-    global_map = {}
-    for t in tokens:
-        if t.kind == TokenKind.IDENTIFIER:
-            if not is_local(t.value, root):
-                if t.value not in global_map:
-                    global_map[t.value] = 0
-    # assign indices
-    names = list(global_map.keys())
-    for i, name in enumerate(names):
-        global_map[name] = i + 1  # 1-indexed
+    # 4. Generate runtime that decodes and executes
+    used = set()
+    runtime = generate_runtime(encrypted, used)
 
-    # 4. Replace globals with lookup table (placeholders)
-    lookup_name = _fresh(set(), confuse=False)
-    tokens = _replace_globals(tokens, global_map, lookup_name)
-
-    # 5. Process tokens: encrypt strings, mask numbers, collect records
-    records = []
-    out_tokens = []
-    # We also need to encrypt the global names for the lookup table
-    # We'll add the global names as strings to the records
-    global_strings = {}
-    for name, idx in global_map.items():
-        # IMPORTANT: wrap the name in quotes so _literal_bytes can parse it
-        enc = _encrypt_string('"' + name + '"', secrets.randbelow(0xFFFFFFFF))
-        global_strings[idx] = len(records)
-        records.append(enc)
-
-    for t in tokens:
-        if t.kind in (TokenKind.STRING, TokenKind.LONG_STRING):
-            enc = _encrypt_string(t.value, secrets.randbelow(0xFFFFFFFF))
-            records.append(enc)
-            out_tokens.append(f"__R{len(records)-1}__")
-        elif t.kind == TokenKind.IDENTIFIER and t.value.startswith("__G") and t.value.endswith("__"):
-            # This is a global placeholder like __G1__
-            idx = int(t.value[3:-2])
-            # Replace with lookup_name[decode(record_index)]
-            rec_idx = global_strings[idx]
-            out_tokens.append(f"{lookup_name}[{rec_idx}]")
-        elif t.kind in (TokenKind.NUMBER, TokenKind.HEX_NUMBER):
-            try:
-                val = int(t.value, 0)
-                if abs(val) < 1000000:
-                    out_tokens.append(_mask_int(val))
-                else: out_tokens.append(t.value)
-            except: out_tokens.append(t.value)
-        else:
-            out_tokens.append(t.value)
-
-    # 6. Shuffle records
-    order = list(range(len(records)))
-    secrets.SystemRandom().shuffle(order)
-    ordered = [records[i] for i in order]
-
-    # 7. Generate runtime
-    runtime_code, decode_fn, global_lookup = generate_runtime(ordered, set(), global_map)
-
-    # 8. Replace placeholders in body tokens
-    body_tokens = []
-    for tok in out_tokens:
-        if tok.startswith("__R") and tok.endswith("__"):
-            idx = int(tok[3:-2])
-            body_tokens.append(f"{decode_fn}({order.index(idx)})")
-        else:
-            body_tokens.append(tok)
-    body = " ".join(body_tokens)
-
-    # 9. Control-flow flattening (lightweight)
-    state = _fresh(set())
-    body_lines = body.splitlines()
-    flattened = [f"local {state}=0", "while true do", f"if {state}==0 then"]
-    flattened.extend("    " + l for l in body_lines)
-    flattened.append(f"    {state}=1")
-    flattened.append(f"elseif {state}==1 then")
-    flattened.append("    break")
-    flattened.append("end")
-    flattened.append("end")
-    body = "\n".join(flattened)
-
-    # 10. Junk code (safe)
-    if OBFUSCATION_LEVEL in ("MAX", "HIGH"):
-        junk = []
-        if secrets.randbelow(100) < 30:
-            v = _fresh(set()); junk.append(f"local {v}={_mask_int(secrets.randbelow(1000))}")
-        if secrets.randbelow(100) < 20:
-            junk.append("if false then end")
-        if junk:
-            body = "\n".join(junk) + "\n" + body
-
-    # 11. Assemble IIFE: (function() ... end)()
-    func_body = runtime_code + "\n" + body
-    final = f"(function(){func_body}end)()"
-
-    # 12. Minify to one line
+    # 5. Wrap in IIFE and minify
+    final = "(function()%s end)()" % runtime
     final = _minify(final)
 
-    # 13. Validate
+    # 6. Validate
     if not _validate(final):
         raise RuntimeError("Validation failed – generated code invalid")
 
