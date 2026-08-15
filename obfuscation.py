@@ -1,921 +1,479 @@
 """
-Hercules Obfuscator – Complete Discord Cog (Single File)
-Combines all logic from the Hercules repository:
-  - modules/Compiler/ (Compiler, Deserializer, Opcode, Serializer, VMStrings, bit)
-  - modules/ (VMGenerator, antitamper, StringToExpressions, WrapInFunction,
-              bytecode_encoder, compressor, control_flow_obfuscator)
+Discord Cog: Hercules‑style obfuscator (without anti‑tamper)
+Command: /obf
+Header: --[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--
 """
 
 import asyncio
 import io
 import re
-import secrets
 import random
-import base64
-import subprocess
-import tempfile
+import string
+import time
 import os
-import math
 from pathlib import Path
-from typing import List, Set, Dict, Tuple, Optional, Any
+from typing import List, Dict, Set, Tuple
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
 # -----------------------------------------------------------------------------
-# 1. CORE HELPERS (from modules/Compiler/bit.lua)
+# OBFUSCATOR CORE (taken from obfuscater.py, anti‑tamper removed)
 # -----------------------------------------------------------------------------
 
-class Bit:
-    """Pure-Lua style bit operations (replicates modules/Compiler/bit.lua)"""
-    @staticmethod
-    def band(a: int, b: int) -> int:
-        result = 0
-        bitval = 1
-        while a > 0 and b > 0:
-            if (a % 2 == 1) and (b % 2 == 1):
-                result += bitval
-            bitval *= 2
-            a //= 2
-            b //= 2
-        return result
-
-    @staticmethod
-    def lshift(x: int, n: int) -> int:
-        return x * (2 ** n)
-
-    @staticmethod
-    def rshift(x: int, n: int) -> int:
-        return x // (2 ** n)
-
-
-# -----------------------------------------------------------------------------
-# 2. SERIALIZER & DESERIALIZER (from modules/Compiler/)
-# -----------------------------------------------------------------------------
-
-class Serializer:
-    """Replicates modules/Compiler/Serializer.lua"""
-    @staticmethod
-    def serialize(chunk: dict) -> bytes:
-        buffer = bytearray()
-
-        def add_byte(val: int):
-            buffer.append(val & 0xFF)
-
-        def write_bits8(val: int):
-            add_byte(val)
-
-        def write_bits16(val: int):
-            for i in range(2):
-                add_byte((val >> (i * 8)) & 0xFF)
-
-        def write_bits32(val: int):
-            for i in range(4):
-                add_byte((val >> (i * 8)) & 0xFF)
-
-        def write_float64(value: float):
-            import struct
-            buffer.extend(struct.pack('<d', value))
-
-        def write_string(s: str):
-            write_bits32(len(s))
-            buffer.extend(s.encode('utf-8'))
-
-        def write_chunk(sub_chunk: dict):
-            write_bits8(sub_chunk.get('upvals', 0))
-            write_bits8(sub_chunk.get('params', 0))
-            write_bits8(sub_chunk.get('maxstack', 0))
-            instrs = sub_chunk.get('instructions', [])
-            write_bits32(len(instrs))
-            for inst in instrs:
-                write_bits32(inst.get('data', 0))
-                write_bits8(inst.get('enum', 0))
-                inst_type = inst.get('type', 'ABC')
-                type_code = 1 if inst_type == 'ABC' else (2 if inst_type == 'ABx' else 3)
-                write_bits8(type_code)
-                write_bits16(inst.get('a', 0))
-                mode_b = inst.get('mode', {}).get('b', 'OpArgN')
-                write_bits8(1 if mode_b == 'OpArgK' else 0)
-                mode_c = inst.get('mode', {}).get('c', 'OpArgN')
-                write_bits8(1 if mode_c == 'OpArgK' else 0)
-                if inst_type == 'ABC':
-                    write_bits16(inst.get('b', 0))
-                    write_bits16(inst.get('c', 0))
-                elif inst_type == 'ABx':
-                    write_bits32(inst.get('bx', 0))
-                elif inst_type == 'AsBx':
-                    write_bits32(inst.get('sbx', 0) + 131071)
-            consts = sub_chunk.get('constants', [])
-            write_bits32(len(consts))
-            for const in consts:
-                ct = type(const)
-                if ct is bool:
-                    write_bits8(1)
-                    write_bits8(1 if const else 0)
-                elif ct in (int, float):
-                    write_bits8(3)
-                    write_float64(float(const))
-                elif ct is str:
-                    write_bits8(4)
-                    write_string(const)
-            protos = sub_chunk.get('protos', [])
-            write_bits32(len(protos))
-            for proto in protos:
-                write_chunk(proto)
-
-        write_chunk(chunk)
-        return bytes(buffer)
-
-
-class Deserializer:
-    """Replicates modules/Compiler/Deserializer.lua"""
-    @staticmethod
-    def deserialize(data: bytes) -> dict:
-        pos = 0
-
-        def read_byte() -> int:
-            nonlocal pos
-            val = data[pos] if pos < len(data) else 0
-            pos += 1
-            return val
-
-        def read_int32() -> int:
-            nonlocal pos
-            val = 0
-            for i in range(4):
-                val |= (data[pos] if pos < len(data) else 0) << (i * 8)
-                pos += 1
-            return val
-
-        def read_float64() -> float:
-            nonlocal pos
-            import struct
-            val = struct.unpack('<d', data[pos:pos+8])[0]
-            pos += 8
-            return val
-
-        def read_string() -> str:
-            length = read_int32()
-            s = data[pos:pos+length].decode('utf-8')
-            pos += length
-            return s
-
-        def read_chunk() -> dict:
-            name = read_string()
-            line = read_int32()
-            lastline = read_int32()
-            upvals = read_byte()
-            params = read_byte()
-            varargs = read_byte()
-            maxstack = read_byte()
-            chunk = {
-                'name': name, 'line': line, 'lastline': lastline,
-                'upvals': upvals, 'params': params, 'varargs': varargs,
-                'maxstack': maxstack,
-                'instructions': [], 'constants': [], 'protos': [],
-                'upvalues': []
-            }
-            # Instructions
-            num_instrs = read_int32()
-            for _ in range(num_instrs):
-                data_val = read_int32()
-                enum_val = read_byte()
-                type_code = read_byte()
-                a_val = read_int32()
-                mode_b = read_byte()
-                mode_c = read_byte()
-                inst_type = 'ABC' if type_code == 1 else ('ABx' if type_code == 2 else 'AsBx')
-                inst = {'data': data_val, 'enum': enum_val, 'type': inst_type, 'a': a_val,
-                        'mode': {'b': 'OpArgK' if mode_b == 1 else 'OpArgN',
-                                 'c': 'OpArgK' if mode_c == 1 else 'OpArgN'}}
-                if inst_type == 'ABC':
-                    inst['b'] = read_int32()
-                    inst['c'] = read_int32()
-                elif inst_type == 'ABx':
-                    inst['bx'] = read_int32()
-                elif inst_type == 'AsBx':
-                    inst['sbx'] = read_int32() - 131071
-                chunk['instructions'].append(inst)
-            # Constants
-            num_consts = read_int32()
-            for _ in range(num_consts):
-                const_type = read_byte()
-                if const_type == 0:  # nil
-                    chunk['constants'].append(None)
-                elif const_type == 1:  # boolean
-                    chunk['constants'].append(read_byte() != 0)
-                elif const_type == 3:  # number
-                    chunk['constants'].append(read_float64())
-                elif const_type == 4:  # string
-                    chunk['constants'].append(read_string())
-            # Protos
-            num_protos = read_int32()
-            for _ in range(num_protos):
-                chunk['protos'].append(read_chunk())
-            return chunk
-
-        return read_chunk()
-
-
-# -----------------------------------------------------------------------------
-# 3. VM GENERATOR (from modules/VMGenerator.lua)
-# -----------------------------------------------------------------------------
-
-class VMGenerator:
-    """Generates the VM runtime from bytecode (replicates VMGenerator.lua)"""
-
-    # From modules/Compiler/VMStrings.lua
-    VARIABLES = r"""
--- Generic Helpers
-local LuaFunc, WrapState, BcToState, gChunk;
-local FIELDS_PER_FLUSH = 50
-local Select = select;
-local function CreateTbl(_) return {} end;
-local Unpack = unpack or table.unpack
-local function Pack(...) return { n = Select('#', ...), ... } end
-local function Move(src, First, Last, Offset, Dst)
-    for i = _, Last - First do
-        Dst[Offset + i] = src[First + i]
-    end
-end
--- Mini Bit Library
-local function BAnd(a, b)
-    local result = _
-    local bitval = __
-    while a > _ and b > _ do
-        if (a % 2 == __) and (b % 2 == __) then
-            result = result + bitval
-        end
-        bitval = bitval * 2
-        a = math.floor(a / 2)
-        b = math.floor(b / 2)
-    end
-    return result
-end
-local function LShift(x, n) return x * 2 ^ n end
-local function RShift(x, n) return math.floor(x / 2 ^ n) end
-local function BOr(a, b)
-    local result = _
-    local shift = __
-    while a > _ or b > _ do
-        local abit = a % 2
-        local bbit = b % 2
-        if abit == __ or bbit == __ then
-            result = result + shift
-        end
-        a = math.floor(a / 2)
-        b = math.floor(b / 2)
-        shift = shift * 2
-    end
-    return result
-end
--- Upvalue Helpers
-local function CloseLuaUpvalues(B, N)
-    for i, uv in pairs(B) do
-        if uv.N >= N then
-            uv.m = uv.M[uv.N];
-            uv.M = uv;
-            uv.N = 'm'
-            B[i] = nil;
-        end;
-    end;
-end;
-local function SenLuaUpvalue(B, N, X)
-    local Prev = B[N]
-    if not Prev then
-        Prev = { N = N, M = X }
-        B[N] = Prev;
-    end
-    return Prev
-end;
-local function NormalizeNumber(value)
-    if type(value) == "number" and value % 1 == 0 then
-        return math.tointeger(value) or value
-    end
-    return value
-end
-local _orig_tostring = tostring
-function tostring(v) return _orig_tostring(v) end
-local asciilookup = {}
-for i = 0, 255 do asciilookup[string.char(i)] = i end
-local function chartoascii(str, pos)
-    pos = pos or 1
-    local ch = str:sub(pos, pos)
-    return asciilookup[ch]
-end
-"""
-
-    DESERIALIZER = r"""
-function BcToState(Bytecode, charset)
-    local base, decoded = #charset, {}
-    local decode_lookup = {}
-    for i = 1, base do
-        decode_lookup[charset:sub(i, i)] = i - 1
-    end
-    for encoded_char in Bytecode:gmatch("([^_]+)") do
-        local n = 0
-        for i = 1, #encoded_char do
-            n = n * base + decode_lookup[encoded_char:sub(i, i)]
-        end
-        decoded[#decoded + 1] = string.char(n)
-    end
-    local bytes = {}
-    for char in table.concat(decoded):gmatch("(.?)\\") do
-        if #char > 0 then
-            bytes[#bytes + 1] = chartoascii(char)
-        end
-    end
-    local Pos = 1
-    local function gBits8()
-        local Val = bytes[Pos]
-        Pos = Pos + 1
-        return Val
-    end
-    local function gBits16()
-        local Val1, Val2 = bytes[Pos], bytes[Pos + 1]
-        Pos = Pos + 2
-        return (Val2 * 256) + Val1
-    end
-    local function gBits32()
-        local Val1, Val2, Val3, Val4 = bytes[Pos], bytes[Pos + 1], bytes[Pos + 2], bytes[Pos + 3]
-        Pos = Pos + 4
-        return (Val4 * 256 ^ 3) + (Val3 * 256 ^ 2) + (Val2 * 256) + Val1
-    end
-    -- Deserialize the chunk
-    -- (Full implementation trimmed for brevity – will be completed in final code)
-    return {}
-end
-"""
-
-    WRAPPER_1 = r"""
--- Wrapper part 1
-"""
-
-    WRAPPER_2 = r"""
--- Wrapper part 2
-"""
-
-    @staticmethod
-    def get_opcode_code(op: int) -> str:
-        """From modules/Compiler/Opcode.lua"""
-        opcodes = {
-            0: "X[Inst.A] = X[Inst.B];",
-            1: "X[Inst.A] = (type(Inst.D) == \"number\" and Inst.D % 1 == 0) and math.floor(Inst.D) or Inst.D",
-            2: "X[Inst.A] = Inst.B ~= 0 if Inst.C ~= 0 then z = z + 1 end;",
-            3: "for i = Inst.A, Inst.B do X[i] = nil end;",
-            4: "local Uv = n[Inst.B] X[Inst.A] = Uv.M[Uv.N]",
-            5: "X[Inst.A] = Env[Inst.D]",
-            6: "local N if Inst.a then N = Inst.R else N = X[Inst.C] end X[Inst.A] = X[Inst.B][N]",
-            7: "Env[Inst.D] = X[Inst.A]",
-            8: "local Uv = n[Inst.B] Uv.M[Uv.N] = X[Inst.A]",
-            9: "local N, m if Inst.s then N = Inst.L else N = X[Inst.B] end if Inst.a then m = Inst.R else m = X[Inst.C] end X[Inst.A][N] = m",
-            10: "X[Inst.A] = {}",
-            11: "local A = Inst.A local B = Inst.B local N; if Inst.a then N = Inst.R else N = X[Inst.C] end X[A + 1] = X[B] X[A] = X[B][N]",
-            12: "local Lhs, Rhs; if Inst.s then Lhs = Inst.L else Lhs = X[Inst.B] end if Inst.a then Rhs = Inst.R else Rhs = X[Inst.C] end X[Inst.A] = NormalizeNumber(Lhs + Rhs)",
-            13: "local Lhs, Rhs; if Inst.s then Lhs = Inst.L else Lhs = X[Inst.B] end if Inst.a then Rhs = Inst.R else Rhs = X[Inst.C] end X[Inst.A] = NormalizeNumber(Lhs - Rhs)",
-            14: "local Lhs, Rhs; if Inst.s then Lhs = Inst.L else Lhs = X[Inst.B] end if Inst.a then Rhs = Inst.R else Rhs = X[Inst.C] end X[Inst.A] = NormalizeNumber(Lhs * Rhs)",
-            15: "local Lhs, Rhs; if Inst.s then Lhs = Inst.L else Lhs = X[Inst.B] end if Inst.a then Rhs = Inst.R else Rhs = X[Inst.C] end X[Inst.A] = NormalizeNumber(Lhs / Rhs)",
-            16: "local Lhs, Rhs; if Inst.s then Lhs = Inst.L else Lhs = X[Inst.B] end if Inst.a then Rhs = Inst.R else Rhs = X[Inst.C] end X[Inst.A] = NormalizeNumber(Lhs % Rhs)",
-        }
-        return opcodes.get(op, "")
-
-    @staticmethod
-    def generate(bytecode: bytes, used_opcodes: dict) -> str:
-        """Generate the complete VM runtime (replicates VMGenerator.generate)"""
-        lines = []
-        def add(line):
-            lines.append(line)
-
-        def generate_variable(length: int) -> str:
-            charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-            return ''.join(random.choice(charset) for _ in range(length))
-
-        def string_shuffle(s: str) -> str:
-            chars = list(s)
-            random.shuffle(chars)
-            return ''.join(chars)
-
-        def get_char(n: int) -> str:
-            return ''.join(chr(i) for i in range(1, n+1))
-
-        # Generate custom charset for encoding
-        charset = string_shuffle(get_char(94))
-        base = len(charset)
-        encode_lookup = {i: charset[i] for i in range(base)}
-        decode_lookup = {charset[i]: i for i in range(base)}
-
-        def encode_number(n: int) -> str:
-            e = []
-            while True:
-                r = n % base
-                e.insert(0, encode_lookup[r])
-                n //= base
-                if n == 0:
-                    break
-            return ''.join(e)
-
-        def encode_string(s: str) -> str:
-            encoded = []
-            for ch in s:
-                encoded.append(encode_number(ord(ch)))
-            return '_'.join(encoded)
-
-        def encode(str_param: str, yes: bool = False) -> str:
-            if not yes:
-                str_param = encode_string(str_param)
-            out = []
-            for ch in str_param:
-                out.append("\\" + str(ord(ch)))
-            return ''.join(out)
-
-        # Bytecode encoding
-        bytecode_str = bytecode.decode('latin-1') if isinstance(bytecode, bytes) else bytecode
-        encoded_bytecode = encode(bytecode_str)
-
-        add('hercules,v1,alpha,__,_ = \'Protected By Hercules V2.0.1 | github.com/zeusssz/hercules-obfuscator\', function()end, true, 1, 0')
-        add(VMGenerator.VARIABLES)
-        add(VMGenerator.DESERIALIZER)
-        add(VMGenerator.WRAPPER_1)
-
-        k = "if"
-        for i, v in used_opcodes.items():
-            op = v
-            add(k + " (S == " + str(op) + ") then\n")
-            add(VMGenerator.get_opcode_code(op))
-            k = "elseif"
-        add("end")
-        add(VMGenerator.WRAPPER_2)
-        add("WrapState(BcToState('" + encoded_bytecode + "','" + encode(charset, True) + "'),(getfenv and getfenv(0)) or _ENV)()")
-
-        return '\n'.join(lines)
-
-
-# -----------------------------------------------------------------------------
-# 4. ANTITAMPER (from modules/antitamper.lua)
-# -----------------------------------------------------------------------------
-
-class AntiTamper:
-    """Replicates modules/antitamper.lua"""
-
-    NATIVE_FUNCS_LUA = [
-        "assert", "error", "pcall", "xpcall", "type", "tostring", "tonumber",
-        "select", "next", "rawget", "rawset", "rawequal", "setmetatable", "getmetatable",
-        "load", "loadfile", "dofile", "collectgarbage",
-        "string.byte", "string.char", "string.dump", "string.find", "string.format",
-        "string.gmatch", "string.gsub", "string.len", "string.lower", "string.match",
-        "string.rep", "string.reverse", "string.sub", "string.upper",
-        "table.insert", "table.remove", "table.sort", "table.concat",
-        "math.abs", "math.acos", "math.asin", "math.atan", "math.ceil", "math.cos",
-        "math.deg", "math.exp", "math.floor", "math.fmod", "math.max", "math.min",
-        "math.modf", "math.rad", "math.sin", "math.sqrt", "math.tan",
-        "os.clock", "os.date", "os.difftime", "os.time", "os.exit",
-        "debug.getinfo", "debug.getlocal", "debug.getupvalue", "debug.traceback",
-        "debug.sethook", "debug.setupvalue",
-    ]
-
-    NATIVE_FUNCS_LUAU = [
-        "assert", "error", "pcall", "xpcall", "type", "tostring", "tonumber",
-        "select", "next", "rawget", "rawset", "rawequal", "setmetatable", "getmetatable",
-        "loadstring",
-        "string.byte", "string.char", "string.find", "string.format",
-        "string.gmatch", "string.gsub", "string.len", "string.lower", "string.match",
-        "string.rep", "string.reverse", "string.sub", "string.upper",
-        "table.insert", "table.remove", "table.sort", "table.concat",
-        "math.abs", "math.acos", "math.asin", "math.atan", "math.ceil", "math.cos",
-        "math.deg", "math.exp", "math.floor", "math.fmod", "math.max", "math.min",
-        "math.modf", "math.rad", "math.sin", "math.sqrt", "math.tan",
-        "os.clock", "os.date", "os.difftime", "os.time",
-    ]
-
-    NATIVE_FUNCS_GLUA = [
-        "assert", "error", "pcall", "xpcall", "type", "tostring", "tonumber",
-        "select", "next", "rawget", "rawset", "rawequal", "setmetatable", "getmetatable",
-        "loadstring",
-        "string.byte", "string.char", "string.find", "string.format",
-        "string.gmatch", "string.gsub", "string.len", "string.lower", "string.match",
-        "string.rep", "string.reverse", "string.sub", "string.upper",
-        "table.insert", "table.remove", "table.sort", "table.concat",
-        "math.abs", "math.acos", "math.asin", "math.atan", "math.ceil", "math.cos",
-        "math.deg", "math.exp", "math.floor", "math.fmod", "math.max", "math.min",
-        "math.modf", "math.rad", "math.sin", "math.sqrt", "math.tan",
-        "os.clock", "os.date", "os.difftime", "os.time",
-        "debug.getinfo", "debug.traceback",
-    ]
-
-    META_METHODS = ["__index", "__newindex", "__metatable", "__call"]
-    META_TABLES = ["string", "table", "math", "os"]
-
-    @classmethod
-    def process(cls, code: str, target: str = "luau") -> str:
-        """Wrap code with anti-tamper checks"""
-        if target == "luau":
-            native_funcs = cls.NATIVE_FUNCS_LUAU
-            debug_keys = '{"info","traceback"}'
-        elif target == "glua":
-            native_funcs = cls.NATIVE_FUNCS_GLUA
-            debug_keys = '{"getinfo","traceback"}'
-        else:
-            native_funcs = cls.NATIVE_FUNCS_LUA
-            debug_keys = '{"getinfo","getlocal","getupvalue","traceback","sethook","setupvalue"}'
-
-        # Build the anti-tamper wrapper as a Lua string
-        func_refs_str = "{"
-        for i, name in enumerate(native_funcs):
-            if i > 0:
-                func_refs_str += ","
-            # Handle dotted names like "string.byte"
-            parts = name.split('.')
-            if len(parts) == 1:
-                func_refs_str += f'["{name}"]={name}'
-            else:
-                # For dotted names, we need to resolve them
-                func_refs_str += f'["{name}"]=(function() local t=_G; for _,p in ipairs({{"{'","'.join(parts)}"}}) do t=t[p] end; return t end)()'
-        func_refs_str += "}"
-
-        meta_refs_str = "{"
-        for i, tname in enumerate(cls.META_TABLES):
-            if i > 0:
-                meta_refs_str += ","
-            for mm in cls.META_METHODS:
-                meta_refs_str += f'["{tname}.{mm}"]=type((getmetatable({tname}) or {{}})[{mm}])'
-        meta_refs_str += "}"
-
-        template = f"""
-do
-    local _BFR,_MFR,T,E,Pa,GM,RG={func_refs_str},{meta_refs_str},type,error,pairs,getmetatable,rawget
-    local DG={{table=table,string=string,math=math,os=os}}
-    local function check()
-        for n,ref in Pa(_BFR) do
-            if ref==nil then
-                E("Tamper Detected! Reason: Critical function removed: "..n)
-                return
-            end
-            if T(ref)~="function" then
-                E("Tamper Detected! Reason: Critical function type changed: "..n.." (was function, now "..T(ref)..")")
-                return
-            end
-        end
-        for tname in Pa(_MFR) do
-            local parts={{}}
-            for p in tname:gmatch("[^.]+") do parts[#parts+1]=p end
-            local t=DG[(parts[1])]
-            if t then
-                local mt=GM(t)
-                if mt then
-                    local mf=RG(mt,parts[2])
-                    if mf then
-                        local expected=_MFR[tname]
-                        if T(mf)~=expected then
-                            E("Tamper Detected! Reason: Metamethod tampered: "..tname)
-                            return
-                        end
-                    end
-                end
-            end
-        end
-        local d=debug
-        if T(d)=="table" then
-            local _DK={debug_keys}
-            for _,k in Pa(_DK) do
-                if T(d[k])~="function" then
-                    E("Tamper Detected! Reason: Debug library incomplete")
-                    return
-                end
-            end
-        end
-    end
-    check()
-end
-{code}
-"""
-        return template
-
-
-# -----------------------------------------------------------------------------
-# 5. STRING TO EXPRESSIONS (from modules/StringToExpressions.lua)
-# -----------------------------------------------------------------------------
-
-class StringToExpressions:
-    """Replaces string literals with character-table lookups"""
-
-    @staticmethod
-    def process(script_content: str, base1: int = 10, base2: int = 100) -> str:
-        used_ascii = {}
-
-        def insert_char(obfuscated: list, ascii_code: int, b1: int, b2: int):
-            used_ascii[ascii_code] = True
-            base = random.randint(b1, b2)
-            if random.randint(0, 1) == 1:
-                part = f"{base} - ({base - ascii_code})"
-            else:
-                part = f"{ascii_code - base} + {base}"
-            obfuscated.append(f"chars[{part}]")
-
-        def format_char(ascii_code: int) -> str:
-            if ascii_code < 32 or ascii_code > 126:
-                return f"\\{ascii_code:03d}"
-            return chr(ascii_code)
-
-        def obfuscate_string_literal(s: str, b1: int, b2: int) -> str:
-            if len(s) == 0:
-                return '""'
-            obfuscated = []
-            for ch in s:
-                insert_char(obfuscated, ord(ch), b1, b2)
-            return '..'.join(obfuscated)
-
-        # Parse and replace strings (simplified version)
-        # Full implementation would handle escapes properly
-        result = []
-        i = 0
-        while i < len(script_content):
-            ch = script_content[i]
-            if ch == '"' or ch == "'":
-                quote = ch
-                start = i
-                i += 1
-                s = ""
-                while i < len(script_content):
-                    c = script_content[i]
-                    if c == '\\':
-                        s += c + script_content[i+1] if i+1 < len(script_content) else c
-                        i += 2
-                    elif c == quote:
-                        i += 1
-                        break
-                    else:
-                        s += c
-                        i += 1
-                # Obfuscate the string content
-                actual = ""
-                j = 0
-                while j < len(s):
-                    c = s[j]
-                    if c == '\\' and j+1 < len(s):
-                        nxt = s[j+1]
-                        if nxt in ('\\', '"', "'"):
-                            actual += nxt
-                            j += 2
-                        elif nxt == 'n':
-                            actual += '\n'
-                            j += 2
-                        elif nxt == 'r':
-                            actual += '\r'
-                            j += 2
-                        elif nxt == 't':
-                            actual += '\t'
-                            j += 2
-                        else:
-                            actual += c
-                            j += 1
-                    else:
-                        actual += c
-                        j += 1
-                result.append(obfuscate_string_literal(actual, base1, base2))
-            else:
-                result.append(ch)
-                i += 1
-
-        return ''.join(result)
-
-
-# -----------------------------------------------------------------------------
-# 6. CONTROL FLOW OBFUSCATOR (from modules/control_flow_obfuscator.lua)
-# -----------------------------------------------------------------------------
-
-class ControlFlowObfuscator:
-    """Adds fake control-flow blocks (lightweight)"""
-
-    @staticmethod
-    def process(code: str, max_fake_blocks: int = 3) -> str:
-        # Simplified version – adds a few dummy while loops
-        lines = code.split('\n')
-        result = []
-        counter = 0
-        for line in lines:
-            result.append(line)
-            if random.random() < 0.1 and counter < max_fake_blocks:
-                # Insert a fake block
-                dummy_var = f"_dummy_{random.randint(1,9999)}"
-                result.append(f"local {dummy_var} = {random.randint(1,100)}")
-                result.append(f"while {dummy_var} < {random.randint(100,200)} do")
-                result.append(f"    {dummy_var} = {dummy_var} + 1")
-                result.append("end")
-                counter += 1
-        return '\n'.join(result)
-
-
-# -----------------------------------------------------------------------------
-# 7. COMPRESSOR (from modules/compressor.lua)
-# -----------------------------------------------------------------------------
-
-class Compressor:
-    """Minifies code by removing whitespace and preserving strings/comments"""
-
-    LUA_KEYWORDS = {"and","break","do","else","elseif","end","false","for","function",
-                    "goto","if","in","local","nil","not","or","repeat","return","then",
-                    "true","until","while"}
-
-    @staticmethod
-    def process(code: str) -> str:
-        if len(code) < 10:
-            return code.strip()
-
-        # Simple minification: remove extra whitespace, but preserve strings
-        # Full implementation would handle strings and comments properly
-        result = []
-        in_string = False
-        quote_char = None
-        in_long_string = False
-        long_eq = 0
-
-        i = 0
-        while i < len(code):
-            ch = code[i]
-
-            # Handle long strings
-            if ch == '[' and i + 1 < len(code) and code[i+1] == '[':
-                eq = 0
-                j = i + 2
-                while j < len(code) and code[j] == '=':
-                    eq += 1
-                    j += 1
-                if j < len(code) and code[j] == '[':
-                    in_long_string = True
-                    long_eq = eq
-                    result.append(ch)
-                    i += 1
-                    continue
-
-            if in_long_string:
-                result.append(ch)
-                if ch == ']' and i + 1 < len(code) and code[i+1] == ']':
-                    # Check if it matches the opening
-                    # Simplified: just close it
-                    in_long_string = False
-                    result.append(']')
-                    i += 1
-                    continue
-                i += 1
-                continue
-
-            # Handle normal strings
-            if ch == '"' or ch == "'":
-                if not in_string:
-                    in_string = True
-                    quote_char = ch
-                    result.append(ch)
-                    i += 1
-                    continue
-                elif ch == quote_char:
-                    in_string = False
-                    quote_char = None
-                    result.append(ch)
-                    i += 1
-                    continue
-
-            if in_string:
-                result.append(ch)
-                i += 1
-                continue
-
-            # Skip comments
-            if ch == '-' and i + 1 < len(code) and code[i+1] == '-':
-                # Skip to end of line
-                while i < len(code) and code[i] != '\n':
-                    i += 1
-                continue
-
-            # Compact whitespace
-            if ch.isspace():
-                # Add a single space if needed
-                if result and not result[-1].isspace():
-                    result.append(' ')
-                i += 1
-                continue
-
-            result.append(ch)
-            i += 1
-
-        return ''.join(result).strip()
-
-
-# -----------------------------------------------------------------------------
-# 8. BYTECODE ENCODER (from modules/bytecode_encoder.lua)
-# -----------------------------------------------------------------------------
-
-class BytecodeEncoder:
-    """Encodes Lua bytecode into a hex string with offset"""
-
-    @staticmethod
-    def process(code: str) -> str:
+TOK_SPEC = [
+    ("COMMENT", r"--\[\[.*?\]\]|--[^\n]*"),
+    ("STRING",  r"\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'"),
+    ("NUMBER",  r"\d+\.?\d*"),
+    ("IDENT",   r"[A-Za-z_][A-Za-z0-9_]*"),
+    ("OP",      r"\.\.\.|==|~=|<=|>=|\.\.|[+\-*/%^#<>]=|[+\-*/%^#<>]|={1,2}"),
+    ("LPAREN",  r"\("), ("RPAREN", r"\)"),
+    ("LBRACE",  r"\{"), ("RBRACE", r"\}"),
+    ("LBRACK",  r"\["), ("RBRACK", r"\]"),
+    ("COMMA",   r","),  ("SEMI",   r";"),
+    ("DOT",     r"\."), ("WS", r"[ \t\r\n]+"), ("OTHER", r"."),
+]
+TOK_RE = re.compile("|".join(f"(?P<{n}>{p})" for n, p in TOK_SPEC), re.DOTALL)
+
+KEYWORDS = {
+    "and","break","do","else","elseif","end","false","for","function","goto",
+    "if","in","local","nil","not","or","repeat","return","then","true","until",
+    "while","continue",
+}
+RESERVED = KEYWORDS | {
+    "print","warn","error","assert","type","typeof","tostring","tonumber","pairs",
+    "ipairs","next","select","unpack","pcall","xpcall","rawget","rawset","rawequal",
+    "setmetatable","getmetatable","require","game","workspace","script","Instance",
+    "Vector3","CFrame","Color3","Enum","task","wait","spawn","delay","tick","time",
+    "os","math","string","table","bit32","utf8","coroutine","debug","buffer",
+    "Players","ReplicatedStorage","ServerStorage","ServerScriptService","StarterGui",
+    "RunService","UserInputService","HttpService","DataStoreService","_G","_ENV",
+    "shared","plugin","BrickColor","Lighting","TweenService","TeleportService",
+    "SoundService","Chat","MarketplaceService","getfenv","setfenv","newproxy","IntValue",
+}
+
+HEADER = "--[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--\n"
+
+NKEYS = 10
+
+class T:
+    __slots__ = ("k", "v")
+    def __init__(self, k, v):
+        self.k, self.v = k, v
+
+def tokenize(src: str) -> List[T]:
+    o = []
+    for m in TOK_RE.finditer(src):
+        k, v = m.lastgroup, m.group()
+        if k in ("WS", "COMMENT"):
+            continue
+        if k == "IDENT" and v in KEYWORDS:
+            k = "KW"
+        o.append(T(k, v))
+    return o
+
+def join_toks(toks: List[T]) -> str:
+    p = []
+    for i, t in enumerate(toks):
+        if i and t.k in ("IDENT", "KW", "NUMBER") and toks[i - 1].k in ("IDENT", "KW", "NUMBER"):
+            p.append(" ")
+        p.append(t.v)
+    return "".join(p)
+
+def minify(code: str) -> str:
+    toks = []
+    for m in TOK_RE.finditer(code):
+        k, v = m.lastgroup, m.group()
+        if k in ("WS", "COMMENT"):
+            continue
+        if k == "IDENT" and v in KEYWORDS:
+            k = "KW"
+        toks.append((k, v))
+    parts = []
+    for i, (k, v) in enumerate(toks):
+        if i and k in ("IDENT", "KW", "NUMBER") and toks[i - 1][0] in ("IDENT", "KW", "NUMBER"):
+            parts.append(" ")
+        parts.append(v)
+    return "".join(parts)
+
+def sp(*parts: str) -> str:
+    return " ".join(p for p in parts if p)
+
+def rol8(v: int, r: int) -> int:
+    r &= 7
+    return ((v << r) | (v >> (8 - r))) & 255
+
+class StringPool:
+    def __init__(self, rn, bx, bo, ba, bl, br, sch, tcat):
+        self.rn = rn
+        self.bx, self.bo, self.ba, self.bl, self.br = bx, bo, ba, bl, br
+        self.sch, self.tcat = sch, tcat
+        self.blobs: List[List[int]] = []
+        self.meta: List[Tuple] = []
+        self.dec = rn(12)
+        self.arr = rn(12)
+        self.cache = rn(11)
+        self.rotate = random.randint(0, 28)
+        self.pos_mul = random.choice([11, 13, 17, 19, 23, 29])
+        self.csum_mul = random.choice([29, 31, 37, 41, 43])
+        self.idx_key = random.randint(1, 255)
+        self.stream_a = random.randint(1000, 99999)
+        self.stream_b = random.randint(1000, 99999)
+
+    def _mk_key(self) -> List[int]:
+        return [random.randint(1, 255) for _ in range(random.randint(5, 12))]
+
+    def add(self, s: str) -> str:
+        data = list(s.encode("utf-8"))
+        mode = random.randint(0, 3)
+        seed = random.randint(1, 2**28 - 1)
+        keys = [self._mk_key() for _ in range(NKEYS)]
+        rots = [random.randint(1, 7) for _ in range(NKEYS)]
+        adds = [random.randint(1, 220) for _ in range(NKEYS)]
+        xs = random.randint(1, 255)
+        pm = self.pos_mul
+        sa, sb = self.stream_a, self.stream_b
+
+        for li in range(NKEYS):
+            k, r, ad = keys[li], rots[li], adds[li]
+            fac = (li + 1) % 7 + 1
+            r2 = (r + li) % 7 + 1
+            for i in range(len(data)):
+                data[i] ^= k[i % len(k)]
+            for i in range(len(data)):
+                data[i] = (data[i] + ad + i * fac) % 256
+            for i in range(len(data)):
+                data[i] = rol8(data[i], r)
+            for i in range(len(data)):
+                data[i] ^= (i * pm + xs + li * 13) & 255
+            for i in range(len(data)):
+                data[i] ^= (seed >> ((i % 4) * 8)) & 255
+            for i in range(len(data)):
+                data[i] = rol8(data[i], r2)
+
+        st = (seed ^ sa) & 0xFFFFFFFF
+        for i in range(len(data)):
+            st = (st * 214013 + 2531011) & 0xFFFFFFFF
+            data[i] ^= (st >> 16) & 255
+            data[i] ^= (i * sb + xs) & 255
+
+        if mode >= 1:
+            for i in range(len(data)):
+                data[i] = ((data[i] & 0x0F) << 4) | ((data[i] & 0xF0) >> 4)
+        if mode >= 2:
+            data = data[::-1]
+        if mode >= 3:
+            for i in range(len(data)):
+                data[i] ^= (0x5A ^ (i * 7 + xs)) & 255
+
+        csum = 0
+        for b in data:
+            csum = (csum + b * self.csum_mul + (seed & 255)) & 0xFFFFFFFF
+        idx = len(self.blobs)
+        self.blobs.append(data)
+        self.meta.append((mode, xs, seed, keys, rots, adds, csum))
+        return self.dec + "(" + self.bx + "(" + str(idx ^ self.idx_key) + "," + str(self.idx_key) + "))"
+
+    def split_add(self, s: str) -> str:
+        if len(s) < 4:
+            return self.add(s)
+        mid = random.randint(1, len(s) - 1)
+        return "(" + self.add(s[:mid]) + ".." + self.add(s[mid:]) + ")"
+
+    def runtime(self) -> str:
+        if not self.blobs:
+            return "local function " + self.dec + "(i) return '' end"
+        order = list(range(len(self.blobs)))
+        random.shuffle(order)
+        r = self.rotate % max(len(order), 1)
+        order = order[r:] + order[:r]
+        inv = [0] * len(self.blobs)
+        for ni, oi in enumerate(order):
+            inv[oi] = ni
+        arr = ",".join("{" + ",".join(map(str, self.blobs[i])) + "}" for i in order)
+        meta = []
+        for i, (mode, xs, seed, keys, rots, adds, csum) in enumerate(self.meta):
+            ks = ",".join("{" + ",".join(map(str, k)) + "}" for k in keys)
+            rs = ",".join(map(str, rots))
+            ads = ",".join(map(str, adds))
+            meta.append("{" + str(mode) + "," + str(xs) + "," + str(seed) + "," + str(inv[i]) + ",{" + ks + "},{" + rs + "},{" + ads + "}," + str(csum) + "}")
+        M = self.rn(10)
+        bx, bo, ba, bl, br = self.bx, self.bo, self.ba, self.bl, self.br
+        sch, tcat = self.sch, self.tcat
+        pm, cm = self.pos_mul, self.csum_mul
+        sa, sb = self.stream_a, self.stream_b
+        return sp(
+            "local " + self.arr + "={" + arr + "}",
+            "local " + M + "={" + ",".join(meta) + "}",
+            "local " + self.cache + "={}",
+            "local function " + self.dec + "(i)",
+            "if " + self.cache + "[i]~=nil then return " + self.cache + "[i] end",
+            "local m=" + M + "[i+1]",
+            "local mode,xs,seed,pi,keys,rots,adds,expect=m[1],m[2],m[3],m[4]+1,m[5],m[6],m[7],m[8]",
+            "local src=" + self.arr + "[pi] local t,cs={},0",
+            "for j=1,#src do t[j]=src[j] cs=(cs+src[j]*" + str(cm) + "+" + ba + "(seed,255))%4294967296 end",
+            "if cs~=expect then return '' end",
+            "if mode>=3 then for j=1,#t do t[j]=" + bx + "(t[j]," + bx + "(90," + ba + "((j-1)*7+xs,255))) end end",
+            "if mode>=2 then local r={} for j=1,#t do r[j]=t[#t-j+1] end t=r end",
+            "if mode>=1 then for j=1,#t do local v=t[j] t[j]=" + bo + "(" + bl + "(" + ba + "(v,15),4)," + br + "(" + ba + "(v,240),4)) end end",
+            "local st=" + bx + "(seed," + str(sa) + ")%4294967296",
+            "for j=1,#t do st=(st*214013+2531011)%4294967296 "
+            "t[j]=" + bx + "(t[j]," + ba + "(" + br + "(st,16),255)) t[j]=" + bx + "(t[j]," + ba + "((j-1)*" + str(sb) + "+xs,255)) end",
+            "for li=" + str(NKEYS) + ",1,-1 do",
+            "local k=keys[li] local rr=rots[li] local ad=adds[li]",
+            "local fac=(li%7)+1 local r2=((rr+(li-1))%7)+1",
+            "for j=1,#t do t[j]=" + bo + "(" + br + "(t[j],r2)," + bl + "(t[j],8-r2)) t[j]=" + ba + "(t[j],255) end",
+            "for j=1,#t do t[j]=" + bx + "(t[j]," + ba + "(" + br + "(seed,((j-1)%4)*8),255)) end",
+            "for j=1,#t do t[j]=" + bx + "(t[j]," + ba + "((j-1)*" + str(pm) + "+xs+(li-1)*13,255)) end",
+            "for j=1,#t do t[j]=" + bo + "(" + br + "(t[j],rr)," + bl + "(t[j],8-rr)) t[j]=" + ba + "(t[j],255) end",
+            "for j=1,#t do local v=(t[j]-ad-((j-1)*fac))%256 if v<0 then v=v+256 end t[j]=v end",
+            "for j=1,#t do t[j]=" + bx + "(t[j],k[((j-1)%#k)+1]) end",
+            "end",
+            "local out={} for j=1,#t do out[j]=" + sch + "(t[j]) end",
+            "local s=" + tcat + "(out) " + self.cache + "[i]=s return s end",
+        )
+
+class Obf:
+    def __init__(self):
+        random.seed(int.from_bytes(os.urandom(16), "big") ^ time.time_ns())
+        self.used: Set[str] = set()
+        self.vmap: Dict[str, str] = {}
+        self.bx = self.rn(10)
+        self.bo = self.rn(10)
+        self.ba = self.rn(10)
+        self.bl = self.rn(10)
+        self.br = self.rn(10)
+        self.sch = self.rn(10)
+        self.tcat = self.rn(10)
+        self.pool = StringPool(
+            self.rn, self.bx, self.bo, self.ba, self.bl, self.br, self.sch, self.tcat
+        )
+        self.num_pool: List[int] = []
+        self.num_name = None
+        self.num_map: Dict[int, int] = {}
+
+    def rn(self, n: int = 0) -> str:
+        n = n or random.randint(10, 14)
+        a = string.ascii_letters + string.digits + "_"
+        while True:
+            s = random.choice(string.ascii_letters + "_") + "".join(random.choices(a, k=n - 1))
+            if s not in self.used and s not in RESERVED:
+                self.used.add(s)
+                return s
+
+    def aliases(self) -> str:
+        return (
+            "local " + self.bx + "=bit32.bxor;"
+            "local " + self.bo + "=bit32.bor;"
+            "local " + self.ba + "=bit32.band;"
+            "local " + self.bl + "=bit32.lshift;"
+            "local " + self.br + "=bit32.rshift;"
+            "local " + self.sch + "=string.char;"
+            "local " + self.tcat + "=table.concat;"
+        )
+
+    def mba(self, n: int) -> str:
+        if n <= 1:
+            return str(n)
+        a = random.randint(5, 90)
+        return random.choice([
+            "((" + str(a + n) + ")-" + str(a) + ")",
+            "(" + self.bx + "(" + str(n ^ a) + "," + str(a) + "))",
+            "((" + str(n + a) + ")-" + str(a) + ")",
+        ])
+
+    def enc_num(self, ns: str) -> str:
         try:
-            # Try to compile and dump the code
-            # Note: This requires a Lua interpreter; we'll use a simple approach
-            import subprocess
-            import tempfile
-            import os
+            n = int(ns)
+        except ValueError:
+            return ns
+        if n <= 1:
+            return ns
+        if random.random() < 0.3:
+            if n not in self.num_map:
+                self.num_map[n] = len(self.num_pool)
+                self.num_pool.append(n)
+            if self.num_name is None:
+                self.num_name = self.rn(11)
+            return self.num_name + "[" + str(self.num_map[n] + 1) + "]"
+        return self.mba(n)
 
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.lua', delete=False) as f:
-                f.write(code)
-                f.flush()
-                # Try to compile with luac
-                result = subprocess.run(['luac', '-o', f.name + 'c', f.name],
-                                       capture_output=True, text=True)
-                if result.returncode != 0:
-                    return code
-                # Read the bytecode
-                with open(f.name + 'c', 'rb') as bf:
-                    bytecode = bf.read()
-                os.unlink(f.name + 'c')
-                os.unlink(f.name)
+    def num_pool_runtime(self) -> str:
+        if not self.num_pool or not self.num_name:
+            return ""
+        return "local " + self.num_name + "={" + ",".join(map(str, self.num_pool)) + "}"
 
-            offset = random.randint(1, 255)
-            encoded = []
-            for b in bytecode:
-                shifted = (b + offset) % 256
-                encoded.append(f"{shifted:02X}")
+    def rename(self, toks: List[T]) -> List[T]:
+        i = 0
+        while i < len(toks):
+            if toks[i].k == "KW" and toks[i].v == "local":
+                j = i + 1
+                if j < len(toks) and toks[j].k == "KW" and toks[j].v == "function":
+                    j += 1
+                    if j < len(toks) and toks[j].k == "IDENT":
+                        n = toks[j].v
+                        if n not in RESERVED and n not in self.vmap:
+                            self.vmap[n] = self.rn()
+                else:
+                    while j < len(toks) and toks[j].k == "IDENT":
+                        n = toks[j].v
+                        if n not in RESERVED and n not in self.vmap:
+                            self.vmap[n] = self.rn()
+                        j += 1
+                        if j < len(toks) and toks[j].k == "COMMA":
+                            j += 1
+                        else:
+                            break
+            elif toks[i].k == "KW" and toks[i].v == "function":
+                if i + 1 < len(toks) and toks[i + 1].k == "IDENT":
+                    n = toks[i + 1].v
+                    if n not in RESERVED and n not in self.vmap:
+                        self.vmap[n] = self.rn()
+            i += 1
+        return [T("IDENT", self.vmap[t.v]) if t.k == "IDENT" and t.v in self.vmap else t for t in toks]
 
-            encoded_hex = ''.join(encoded)
-            template = f"""
-local e, o, d = "{encoded_hex}", {offset}, {{}}
-for i = 1, #e, 2 do
-    local b = tonumber(e:sub(i, i + 1), 16)
-    b = (b - o + 256) % 256
-    d[#d + 1] = string.char(b)
-end
-local f = assert(load(table.concat(d)))
-f()
-"""
-            return template
-        except:
-            return code
+    def literals(self, toks: List[T]) -> List[T]:
+        o = []
+        for t in toks:
+            if t.k == "STRING":
+                raw = t.v[1:-1]
+                raw = (raw.replace("\\n", "\n").replace("\\t", "\t")
+                       .replace("\\\\", "\\").replace('\\"', '"').replace("\\'", "'"))
+                if not raw or raw.startswith(("rbxasset", "http")):
+                    o.append(t)
+                elif len(raw) >= 3:
+                    o.append(T("OTHER", self.pool.split_add(raw)))
+                else:
+                    o.append(T("OTHER", self.pool.add(raw)))
+            elif t.k == "NUMBER" and "." not in t.v:
+                o.append(T("OTHER", self.enc_num(t.v)))
+            else:
+                o.append(t)
+        return o
+
+    def table_layer(self) -> str:
+        Env, T1, T2 = self.rn(), self.rn(), self.rn()
+        k1, k2 = self.rn(), self.rn()
+        return sp(
+            "local " + Env + "=(function() local ok,e=pcall(function() return getfenv and getfenv() end) "
+            "if ok and type(e)=='table' then return e end return _ENV or _G or {} end)()",
+            "local " + T1 + "={} local " + T2 + "={}",
+            "local " + k1 + "='" + self.rn() + "' local " + k2 + "='" + self.rn() + "'",
+            T1 + "[" + k1 + "]=print " + T1 + "[" + k2 + "]=type " + T2 + "[1]=" + T1 + " " + T2 + "[2]=" + Env,
+        )
+
+    def junk(self, n: int = 4) -> str:
+        parts = []
+        for _ in range(n):
+            v = self.rn()
+            x, y = random.randint(1, 80), random.randint(1, 80)
+            parts.append(random.choice([
+                "local " + v + "={}",
+                "local " + v + "=function(...) end",
+                "local " + v + "=" + self.bx + "(" + str(x) + "," + str(y) + ")",
+                "if false then local " + v + "=" + str(x) + " end",
+            ]))
+        return sp(*parts)
+
+    def encrypt_bc(self, prog: List[int]) -> Tuple[List[int], dict]:
+        k1 = random.randint(1, 255)
+        mix = random.randint(1, 255)
+        out = [(prog[i] ^ k1 ^ ((i * mix) & 255)) & 255 for i in range(len(prog))]
+        return out, {"k1": k1, "mix": mix}
+
+    def make_vm(self, body: str) -> str:
+        ops = [
+            "LOADK", "MOVE", "CALL", "NOP", "HALT", "LOADN",
+            "LOADCALL", "LKCALL", "MOVCALL", "DEAD", "XOR", "GET",
+            "LNADD", "BAND",
+        ]
+        ids = random.sample(range(8, 240), len(ops))
+        OP = dict(zip(ops, ids))
+
+        def ins(op, a=0, b=0):
+            return [OP[op], a & 255, b & 255]
+
+        prog: List[int] = []
+        for _ in range(random.randint(3, 6)):
+            prog += ins(
+                random.choice(["NOP", "DEAD", "LOADN", "XOR", "LNADD", "BAND"]),
+                random.randint(4, 8),
+                random.randint(0, 20),
+            )
+        prog += ins("LKCALL", 1, 1)
+        prog += ins("HALT")
+
+        enc, ek = self.encrypt_bc(prog)
+        N = {k: self.rn(11) for k in OP}
+        R, K, B, PC, OV, AV, BV, FN = [self.rn(9) for _ in range(8)]
+        HT, H = self.rn(10), self.rn(9)
+        KEY, MIX = self.rn(8), self.rn(8)
+        bx, ba = self.bx, self.ba
+
+        decl = sp(*["local " + N[k] + "=" + str(OP[k]) for k in OP])
+        reg_order = list(OP.keys())
+        random.shuffle(reg_order)
+
+        bodies = {
+            "LOADK": "function() " + R + "[" + AV + "]=" + K + "[" + BV + "] end",
+            "MOVE": "function() " + R + "[" + AV + "]=" + R + "[" + BV + "] end",
+            "CALL": "function() " + FN + "=" + R + "[" + AV + "] if type(" + FN + ")=='function' then " + FN + "() end end",
+            "LOADCALL": "function() " + FN + "=" + R + "[" + AV + "] if type(" + FN + ")=='function' then " + FN + "() end end",
+            "LKCALL": "function() " + R + "[" + AV + "]=" + K + "[" + BV + "] " + FN + "=" + R + "[" + AV + "] if type(" + FN + ")=='function' then " + FN + "() end end",
+            "MOVCALL": "function() " + R + "[" + AV + "]=" + R + "[" + BV + "] " + FN + "=" + R + "[" + AV + "] if type(" + FN + ")=='function' then " + FN + "() end end",
+            "NOP": "function() end",
+            "DEAD": "function() end",
+            "LOADN": "function() " + R + "[" + AV + "]=" + BV + " end",
+            "LNADD": "function() " + R + "[" + AV + "]=" + BV + " " + R + "[" + AV + "]=(" + R + "[" + AV + "] or 0)+(" + R + "[" + AV + "] or 0) end",
+            "XOR": "function() " + R + "[" + AV + "]=" + bx + "((" + R + "[" + AV + "] or 0),(" + R + "[" + BV + "] or 0)) end",
+            "BAND": "function() " + R + "[" + AV + "]=" + ba + "((" + R + "[" + AV + "] or 0),(" + R + "[" + BV + "] or 0)) end",
+            "GET": "function() " + R + "[" + AV + "]=" + R + "[" + BV + "] end",
+            "HALT": "function() " + PC + "=-1 end",
+        }
+
+        assigns = []
+        for op in reg_order:
+            assigns.append(HT + "[" + N[op] + "]=" + bodies[op])
+        for _ in range(random.randint(2, 4)):
+            did = random.randint(1, 255)
+            while did in ids:
+                did = random.randint(1, 255)
+            assigns.append(HT + "[" + str(did) + "]=function() end")
+        random.shuffle(assigns)
+
+        return sp(
+            decl,
+            "local " + K + "={function() " + body + " end}",
+            "local " + R + "={}",
+            "local " + B + "={" + ",".join(map(str, enc)) + "}",
+            "local " + KEY + "=" + str(ek["k1"]) + " local " + MIX + "=" + str(ek["mix"]),
+            "local " + PC + "=1 local " + FN + "=nil local " + AV + "=0 local " + BV + "=0 local " + OV + "=0",
+            "local " + HT + "={}",
+            *assigns,
+            "while " + PC + ">0 do",
+            OV + "=" + bx + "(" + B + "[" + PC + "]," + bx + "(" + KEY + "," + ba + "((" + PC + "-1)*" + MIX + ",255)))",
+            AV + "=" + bx + "(" + B + "[" + PC + "+1]," + bx + "(" + KEY + "," + ba + "((" + PC + ")*" + MIX + ",255)))",
+            BV + "=" + bx + "(" + B + "[" + PC + "+2]," + bx + "(" + KEY + "," + ba + "((" + PC + "+1)*" + MIX + ",255)))",
+            PC + "=" + PC + "+3",
+            "local " + H + "=" + HT + "[" + OV + "]",
+            "if " + H + " then " + H + "() end",
+            "end",
+        )
+
+    def run(self, src: str) -> str:
+        toks = self.literals(self.rename(tokenize(src)))
+        body = join_toks(toks)
+        # Anti‑tamper removed – only table layer + junk + body
+        body = sp(self.table_layer(), self.junk(4), body)
+        inner = sp(self.pool.runtime(), self.num_pool_runtime(), body)
+        vm = self.make_vm(inner)
+        code = self.aliases() + "(function() " + vm + " end)()"
+        return HEADER + "\n" + minify(code)
 
 
 # -----------------------------------------------------------------------------
-# 9. WRAP IN FUNCTION (from modules/WrapInFunction.lua)
-# -----------------------------------------------------------------------------
-
-class WrapInFunction:
-    @staticmethod
-    def process(code: str) -> str:
-        return f"(function(...) {code} end)()"
-
-
-# -----------------------------------------------------------------------------
-# 10. MAIN OBFUSCATOR PIPELINE (combining all modules)
-# -----------------------------------------------------------------------------
-
-class HerculesObfuscator:
-    """Complete obfuscation pipeline combining all modules"""
-
-    @staticmethod
-    def obfuscate(source: str, options: dict = None) -> str:
-        if options is None:
-            options = {
-                "target": "luau",
-                "string_encryption": True,
-                "integer_encryption": True,
-                "control_flow": True,
-                "anti_tamper": True,
-                "bytecode_encoding": False,
-                "compress": True,
-                "wrap": True,
-                "string_to_expressions": True,
-            }
-
-        code = source
-
-        # Step 1: String to Expressions (optional)
-        if options.get("string_to_expressions", False):
-            code = StringToExpressions.process(code)
-
-        # Step 2: Control Flow Obfuscation (optional)
-        if options.get("control_flow", False):
-            code = ControlFlowObfuscator.process(code)
-
-        # Step 3: Wrap in function (optional)
-        if options.get("wrap", True):
-            code = WrapInFunction.process(code)
-
-        # Step 4: Anti-tamper (optional)
-        if options.get("anti_tamper", True):
-            code = AntiTamper.process(code, options.get("target", "luau"))
-
-        # Step 5: Bytecode encoding (optional, requires luac)
-        if options.get("bytecode_encoding", False):
-            code = BytecodeEncoder.process(code)
-
-        # Step 6: Compress/minify (optional)
-        if options.get("compress", True):
-            code = Compressor.process(code)
-
-        return code
-
-
-# -----------------------------------------------------------------------------
-# 11. DISCORD COG
+# DISCORD COG
 # -----------------------------------------------------------------------------
 
 MAX_SOURCE_BYTES = 750_000
@@ -924,25 +482,13 @@ def _output_name(filename: str) -> str:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename).stem).strip("._")
     return f"{stem or 'script'}.obfuscated.lua"
 
-class HerculesObfuscatorCog(commands.Cog):
+class Obfuscation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="obf", description="Obfuscate a Luau file using the Hercules Obfuscator")
-    @app_commands.describe(
-        file="Attach the .lua or .txt Luau source file to obfuscate",
-        anti_tamper="Add anti-tamper checks (default: true)",
-        control_flow="Add control-flow obfuscation (default: true)",
-        compress="Minify the output (default: true)",
-        wrap="Wrap in IIFE (default: true)",
-        target="Target environment: luau, lua, or glua (default: luau)"
-    )
-    async def obf(self, interaction: discord.Interaction, file: discord.Attachment,
-                  anti_tamper: bool = True,
-                  control_flow: bool = True,
-                  compress: bool = True,
-                  wrap: bool = True,
-                  target: str = "luau"):
+    @app_commands.command(name="obf", description="Obfuscate a Luau file using the Hercules‑style obfuscator")
+    @app_commands.describe(file="Attach the .lua or .txt Luau source file to obfuscate")
+    async def obf(self, interaction: discord.Interaction, file: discord.Attachment):
         if not file.filename.lower().endswith((".lua", ".txt")):
             await interaction.response.send_message("Please upload a `.lua` or `.txt` file.", ephemeral=True)
             return
@@ -961,31 +507,11 @@ class HerculesObfuscatorCog(commands.Cog):
                 await interaction.followup.send("The file is empty.", ephemeral=True)
                 return
 
-            options = {
-                "target": target,
-                "anti_tamper": anti_tamper,
-                "control_flow": control_flow,
-                "compress": compress,
-                "wrap": wrap,
-                "string_to_expressions": True,
-                "bytecode_encoding": False,
-                "string_encryption": True,
-                "integer_encryption": True,
-            }
-
-            # Run obfuscation in a thread to avoid blocking the event loop
-            obfuscated = await asyncio.to_thread(
-                HerculesObfuscator.obfuscate,
-                source,
-                options
-            )
-
-            # Add the header with the Discord invite
-            header = "--[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--\n"
-            final_output = header + obfuscated
+            # Run obfuscator in a thread to avoid blocking
+            obfuscated = await asyncio.to_thread(Obf().run, source)
 
             out_file = discord.File(
-                io.BytesIO(final_output.encode("utf-8")),
+                io.BytesIO(obfuscated.encode("utf-8")),
                 filename=_output_name(file.filename)
             )
             await interaction.followup.send(
@@ -1000,8 +526,8 @@ class HerculesObfuscatorCog(commands.Cog):
 
 
 # -----------------------------------------------------------------------------
-# 12. SETUP
+# SETUP
 # -----------------------------------------------------------------------------
 
 async def setup(bot: commands.Bot):
-    await bot.add_cog(HerculesObfuscatorCog(bot))
+    await bot.add_cog(Obfuscation(bot))
