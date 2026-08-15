@@ -1,5 +1,5 @@
 """
-Discord Cog: Decentralized multi‑chunk obfuscator (syntax‑safe)
+Discord Cog: Decentralized multi‑chunk obfuscator (syntax‑safe, robust)
 Command: /obf
 Header: --[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--
 """
@@ -387,23 +387,24 @@ class Obf:
         # 2. Split source into chunks (at newlines)
         full_code = join_toks(toks)
         lines = full_code.split('\n')
-        num_chunks = random.randint(2, min(6, len(lines)))
-        if num_chunks < 2 and len(lines) > 1:
-            num_chunks = 2
-        # If only one line, use single chunk
-        if len(lines) == 1:
-            num_chunks = 1
+        num_lines = len(lines)
 
-        # Randomly assign lines to chunks
-        chunks = []
-        if num_chunks == 1:
-            chunks.append(full_code)
+        # Determine number of chunks
+        if num_lines <= 1:
+            num_chunks = 1
         else:
-            # Randomly split lines
+            num_chunks = random.randint(2, min(6, num_lines))
+
+        # If only one chunk, just use full code
+        if num_chunks == 1:
+            chunks = [full_code]
+        else:
+            # Randomly split lines into chunks
+            chunks = []
             idx = 0
             for i in range(num_chunks - 1):
-                remaining = len(lines) - idx
-                # choose a size that leaves at least one line for the last chunk
+                remaining = num_lines - idx
+                # ensure at least one line left for last chunk
                 max_size = max(1, remaining - (num_chunks - i - 1))
                 size = random.randint(1, max_size)
                 chunks.append('\n'.join(lines[idx:idx+size]))
@@ -418,11 +419,61 @@ class Obf:
                 continue
             enc = ChunkEncryptor(self.rn, self.bx, self.bo, self.ba, self.bl, self.br, self.sch, self.tcat)
             chunk_toks = self.literals(tokenize(chunk), enc)
-            chunk_body = join_toks(chunk_toks)
-            # We don't need to execute the chunk body separately; we'll decode it as a string.
-            # The encryptor's `add` method already placed the chunk's source in a blob,
-            # and `enc.dec(0)` will return the decoded string.
-            chunk_parts.append(enc.dec + "(0)")
+            # We don't need to join chunk_toks because the encryptor already stores the source
+            # The `add` method of ChunkEncryptor is used for strings, but we need to encrypt the whole chunk as a string.
+            # Actually the chunk is the source code; we need to treat it as a string literal.
+            # We'll use enc.add on the chunk string directly.
+            # But we already processed individual string literals in chunk_toks; that's for obfuscating string constants within the code.
+            # The chunk itself is not a string literal; it's source code that we need to hide.
+            # Our approach: we take the original chunk source (as a string) and encrypt it using the same encryption that is used for string literals.
+            # However, the encryption used for string literals is meant for small strings; for large code we need to handle it differently.
+            # Actually we can just use the same mechanism: we have a blob that stores the chunk source as bytes.
+            # The `add` method encrypts a string and returns a call to `dec(idx)`.
+            # So we can encrypt the entire chunk source using `enc.add(chunk)`.
+            # But `add` expects a string literal (without quotes), it will encode it and store it.
+            # So we just call `enc.add(chunk)` and it will return `dec(...)`.
+            # However, this will treat the chunk source as a string and encrypt it.
+            # Then later when `dec(0)` is called, it will return the original chunk source.
+            # That's exactly what we want.
+            # So we'll use `enc.add(chunk)` to store the chunk source.
+            # But we also need to handle the fact that the chunk may contain quotes, which would break if we try to embed it as a string literal.
+            # Since we're encrypting it, we don't need to quote it; `add` takes a raw string and encodes it as bytes.
+            # So it's safe.
+            # However, we already have `enc.add` used for string literals. We'll use a separate method to store the whole chunk.
+            # Actually we can just call `enc.add(chunk)` for the chunk, and it will create a blob for it.
+            # But we already created blobs for individual string literals within the chunk. Those are separate.
+            # So we need to store the chunk as a whole separate blob.
+            # The `ChunkEncryptor` has a `blobs` list. We can add the chunk source as a blob.
+            # But `add` also increments the blob count and returns a `dec` call. We can store that call in chunk_parts.
+            # So for each chunk, we do: `enc.add(chunk)` and that will add the chunk source as a blob.
+            # Then we also need to handle the string literals inside the chunk; they are already handled by `literals`.
+            # But if we call `enc.add(chunk)` after processing string literals, the chunk source still contains the original string literals (not replaced). We need to replace them with encrypted calls.
+            # That's why we processed chunk_toks and generated an encrypted version of the chunk with the string literals replaced.
+            # But we also need to encrypt the whole chunk source (the code itself) and store it.
+            # We can use the encrypted chunk body (with string literals replaced) as the source to encrypt.
+            # So we should first process the chunk with `literals` to replace string literals, then use that processed code as the chunk source to encrypt.
+            # So the flow:
+            #   - For each chunk, we get the chunk source.
+            #   - We tokenize it, replace string literals with encrypted calls, and get `chunk_body`.
+            #   - Then we take `chunk_body` (which is the source with strings obfuscated) and encrypt it as a whole using `enc.add(chunk_body)`.
+            #   - The `dec` call will return the `chunk_body` when executed.
+            #   - Then in the main runner, we concatenate all decoded chunk bodies and run loadstring.
+            # That is correct.
+            # So we'll do:
+            chunk_body = join_toks(chunk_toks)  # chunk with string literals replaced
+            # Now encrypt the entire chunk body as a string
+            enc.add(chunk_body)  # this stores it as a blob and returns dec(...)
+            # We need to get the dec call for this blob. Since it's the only blob (or we can get the latest), we'll store it.
+            # `enc.add` returns the call string like "dec(x)" where dec is enc.dec and x is the encrypted index.
+            # We can store that.
+            # However, if we already added string literals as blobs before, then the first blob would be the chunk body? Actually we call `literals` before encrypting the chunk body. But `literals` calls `enc.add` for string literals, which adds blobs. So by the time we call `enc.add(chunk_body)`, there will be previous blobs. So we need to know which blob corresponds to the chunk body.
+            # We can simply add the chunk body as a new blob and get its index. The easiest way: after processing all string literals, we call `enc.add(chunk_body)` which returns a `dec(...)` call that points to the new blob. We'll store that call.
+            # But careful: if there are multiple string literals, they are stored in separate blobs, and the chunk body is stored as an additional blob. So we need to store the index of the chunk body blob.
+            # We can do: `chunk_dec_call = enc.add(chunk_body)` and then store that in chunk_parts.
+            # That ensures we have the correct blob for the whole chunk.
+            # So we'll do that.
+            chunk_dec_call = enc.add(chunk_body)
+            chunk_parts.append(chunk_dec_call)
             self.encryptors.append(enc)
 
         # 4. Generate all decoders
@@ -431,9 +482,7 @@ class Obf:
             decoders_code.append(enc.runtime())
 
         # 5. Build the main runner: collect decoded strings, concatenate, loadstring and execute
-        # We'll use a table to hold the chunks, then concat.
-        # To avoid global pollution, everything is local.
-        # We'll also include a pcall for error handling.
+        # Use a table to hold the chunk dec calls, then concat.
         collect = (
             "local _chunks={" + ",".join(chunk_parts) + "}\n"
             "local _full=" + self.tcat + "(_chunks)\n"
