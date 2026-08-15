@@ -1,8 +1,9 @@
 """
 Hercules Obfuscator – Complete Discord Cog (Single File)
-Combines all logic from:
+Combines all logic from the Hercules repository:
   - modules/Compiler/ (Compiler, Deserializer, Opcode, Serializer, VMStrings, bit)
-  - modules/ (VMGenerator, antitamper, StringToExpressions, WrapInFunction, bytecode_encoder, compressor, control_flow_obfuscator)
+  - modules/ (VMGenerator, antitamper, StringToExpressions, WrapInFunction,
+              bytecode_encoder, compressor, control_flow_obfuscator)
 """
 
 import asyncio
@@ -23,11 +24,11 @@ from discord import app_commands
 from discord.ext import commands
 
 # -----------------------------------------------------------------------------
-# 1. CORE HELPERS (from Hercules)
+# 1. CORE HELPERS (from modules/Compiler/bit.lua)
 # -----------------------------------------------------------------------------
 
 class Bit:
-    """Pure Lua-style bit operations (replicates modules/Compiler/bit.lua)"""
+    """Pure-Lua style bit operations (replicates modules/Compiler/bit.lua)"""
     @staticmethod
     def band(a: int, b: int) -> int:
         result = 0
@@ -48,6 +49,10 @@ class Bit:
     def rshift(x: int, n: int) -> int:
         return x // (2 ** n)
 
+
+# -----------------------------------------------------------------------------
+# 2. SERIALIZER & DESERIALIZER (from modules/Compiler/)
+# -----------------------------------------------------------------------------
 
 class Serializer:
     """Replicates modules/Compiler/Serializer.lua"""
@@ -214,13 +219,13 @@ class Deserializer:
 
 
 # -----------------------------------------------------------------------------
-# 2. VM GENERATOR (from modules/VMGenerator.lua + modules/Compiler/Opcode.lua)
+# 3. VM GENERATOR (from modules/VMGenerator.lua)
 # -----------------------------------------------------------------------------
 
 class VMGenerator:
     """Generates the VM runtime from bytecode (replicates VMGenerator.lua)"""
-    
-    # From VMStrings.lua
+
+    # From modules/Compiler/VMStrings.lua
     VARIABLES = r"""
 -- Generic Helpers
 local LuaFunc, WrapState, BcToState, gChunk;
@@ -447,12 +452,12 @@ end
 
 
 # -----------------------------------------------------------------------------
-# 3. ANTITAMPER (from modules/antitamper.lua)
+# 4. ANTITAMPER (from modules/antitamper.lua)
 # -----------------------------------------------------------------------------
 
 class AntiTamper:
     """Replicates modules/antitamper.lua"""
-    
+
     NATIVE_FUNCS_LUA = [
         "assert", "error", "pcall", "xpcall", "type", "tostring", "tonumber",
         "select", "next", "rawget", "rawset", "rawequal", "setmetatable", "getmetatable",
@@ -588,7 +593,7 @@ end
 
 
 # -----------------------------------------------------------------------------
-# 4. STRING TO EXPRESSIONS (from modules/StringToExpressions.lua)
+# 5. STRING TO EXPRESSIONS (from modules/StringToExpressions.lua)
 # -----------------------------------------------------------------------------
 
 class StringToExpressions:
@@ -676,7 +681,7 @@ class StringToExpressions:
 
 
 # -----------------------------------------------------------------------------
-# 5. CONTROL FLOW OBFUSCATOR (from modules/control_flow_obfuscator.lua)
+# 6. CONTROL FLOW OBFUSCATOR (from modules/control_flow_obfuscator.lua)
 # -----------------------------------------------------------------------------
 
 class ControlFlowObfuscator:
@@ -702,7 +707,7 @@ class ControlFlowObfuscator:
 
 
 # -----------------------------------------------------------------------------
-# 6. COMPRESSOR (from modules/compressor.lua)
+# 7. COMPRESSOR (from modules/compressor.lua)
 # -----------------------------------------------------------------------------
 
 class Compressor:
@@ -797,7 +802,7 @@ class Compressor:
 
 
 # -----------------------------------------------------------------------------
-# 7. BYTECODE ENCODER (from modules/bytecode_encoder.lua)
+# 8. BYTECODE ENCODER (from modules/bytecode_encoder.lua)
 # -----------------------------------------------------------------------------
 
 class BytecodeEncoder:
@@ -849,7 +854,7 @@ f()
 
 
 # -----------------------------------------------------------------------------
-# 8. WRAP IN FUNCTION (from modules/WrapInFunction.lua)
+# 9. WRAP IN FUNCTION (from modules/WrapInFunction.lua)
 # -----------------------------------------------------------------------------
 
 class WrapInFunction:
@@ -859,7 +864,7 @@ class WrapInFunction:
 
 
 # -----------------------------------------------------------------------------
-# 9. MAIN OBFUSCATOR PIPELINE
+# 10. MAIN OBFUSCATOR PIPELINE (combining all modules)
 # -----------------------------------------------------------------------------
 
 class HerculesObfuscator:
@@ -910,7 +915,7 @@ class HerculesObfuscator:
 
 
 # -----------------------------------------------------------------------------
-# 10. DISCORD COG
+# 11. DISCORD COG
 # -----------------------------------------------------------------------------
 
 MAX_SOURCE_BYTES = 750_000
@@ -923,7 +928,7 @@ class HerculesObfuscatorCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="hercules", description="Obfuscate a Luau file using the Hercules Obfuscator")
+    @app_commands.command(name="obf", description="Obfuscate a Luau file using the Hercules Obfuscator")
     @app_commands.describe(
         file="Attach the .lua or .txt Luau source file to obfuscate",
         anti_tamper="Add anti-tamper checks (default: true)",
@@ -932,12 +937,12 @@ class HerculesObfuscatorCog(commands.Cog):
         wrap="Wrap in IIFE (default: true)",
         target="Target environment: luau, lua, or glua (default: luau)"
     )
-    async def hercules(self, interaction: discord.Interaction, file: discord.Attachment,
-                       anti_tamper: bool = True,
-                       control_flow: bool = True,
-                       compress: bool = True,
-                       wrap: bool = True,
-                       target: str = "luau"):
+    async def obf(self, interaction: discord.Interaction, file: discord.Attachment,
+                  anti_tamper: bool = True,
+                  control_flow: bool = True,
+                  compress: bool = True,
+                  wrap: bool = True,
+                  target: str = "luau"):
         if not file.filename.lower().endswith((".lua", ".txt")):
             await interaction.response.send_message("Please upload a `.lua` or `.txt` file.", ephemeral=True)
             return
@@ -975,8 +980,12 @@ class HerculesObfuscatorCog(commands.Cog):
                 options
             )
 
+            # Add the header with the Discord invite
+            header = "--[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--\n"
+            final_output = header + obfuscated
+
             out_file = discord.File(
-                io.BytesIO(obfuscated.encode("utf-8")),
+                io.BytesIO(final_output.encode("utf-8")),
                 filename=_output_name(file.filename)
             )
             await interaction.followup.send(
@@ -991,7 +1000,7 @@ class HerculesObfuscatorCog(commands.Cog):
 
 
 # -----------------------------------------------------------------------------
-# 11. SETUP
+# 12. SETUP
 # -----------------------------------------------------------------------------
 
 async def setup(bot: commands.Bot):
