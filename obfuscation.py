@@ -1,5 +1,5 @@
 """
-Discord Cog: Hercules‑style obfuscator (decentralized, multi‑chunk)
+Discord Cog: Decentralized multi‑chunk obfuscator (syntax‑safe)
 Command: /obf
 Header: --[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--
 """
@@ -19,7 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 
 # -----------------------------------------------------------------------------
-# OBFUSCATOR CORE – multi‑chunk decentralized version
+# OBFUSCATOR CORE – multi‑chunk decentralized, syntax‑safe
 # -----------------------------------------------------------------------------
 
 TOK_SPEC = [
@@ -54,7 +54,6 @@ RESERVED = KEYWORDS | {
 }
 
 HEADER = "--[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--\n"
-
 NKEYS = 10
 
 class T:
@@ -105,10 +104,9 @@ def rol8(v: int, r: int) -> int:
     return ((v << r) | (v >> (8 - r))) & 255
 
 # -----------------------------------------------------------------------------
-# CHUNK ENCRYPTION (per‑chunk StringPool)
+# CHUNK ENCRYPTOR (per‑chunk)
 # -----------------------------------------------------------------------------
 class ChunkEncryptor:
-    """Encrypts a single chunk with its own random transforms and stores metadata."""
     def __init__(self, rn, bx, bo, ba, bl, br, sch, tcat):
         self.rn = rn
         self.bx, self.bo, self.ba, self.bl, self.br = bx, bo, ba, bl, br
@@ -186,7 +184,7 @@ class ChunkEncryptor:
         return "(" + self.add(s[:mid]) + ".." + self.add(s[mid:]) + ")"
 
     def runtime(self) -> str:
-        """Generate code for this chunk's decoder."""
+        """Generate code for this chunk's decoder (returns a string)."""
         if not self.blobs:
             return "local function " + self.dec + "(i) return '' end"
         order = list(range(len(self.blobs)))
@@ -240,7 +238,7 @@ class ChunkEncryptor:
         )
 
 # -----------------------------------------------------------------------------
-# MAIN OBFUSCATOR – multi‑chunk decentralized
+# MAIN OBFUSCATOR – multi‑chunk decentralized, syntax‑safe
 # -----------------------------------------------------------------------------
 class Obf:
     def __init__(self):
@@ -254,7 +252,6 @@ class Obf:
         self.br = self.rn(10)
         self.sch = self.rn(10)
         self.tcat = self.rn(10)
-        # We'll create one encryptor per chunk later
         self.encryptors: List[ChunkEncryptor] = []
         self.num_pool: List[int] = []
         self.num_name = None
@@ -384,101 +381,79 @@ class Obf:
         return sp(*parts)
 
     def run(self, src: str) -> str:
-        # Step 1: rename and tokenize
+        # 1. Rename and tokenize
         toks = self.rename(tokenize(src))
 
-        # Step 2: split source into chunks (at newlines)
-        lines = join_toks(toks).split('\n')
-        num_chunks = random.randint(2, 6)
-        # Ensure we have at least 2 chunks if possible
-        if len(lines) < num_chunks:
-            num_chunks = max(2, len(lines) // 2)
-            if num_chunks < 2:
-                num_chunks = 1  # fallback
+        # 2. Split source into chunks (at newlines)
+        full_code = join_toks(toks)
+        lines = full_code.split('\n')
+        num_chunks = random.randint(2, min(6, len(lines)))
+        if num_chunks < 2 and len(lines) > 1:
+            num_chunks = 2
+        # If only one line, use single chunk
+        if len(lines) == 1:
+            num_chunks = 1
 
-        # Randomly split lines into chunks
-        chunk_sizes = []
-        total = len(lines)
-        for i in range(num_chunks):
-            if i == num_chunks - 1:
-                chunk_sizes.append(total)
-            else:
-                sz = random.randint(1, max(1, total // (num_chunks - i)))
-                chunk_sizes.append(sz)
-                total -= sz
-        # Adjust the last chunk to include remaining lines
-        # Actually we'll just use the sizes as number of lines per chunk
-        # We'll re-calculate properly
+        # Randomly assign lines to chunks
         chunks = []
-        idx = 0
-        for size in chunk_sizes[:-1]:
-            if idx + size > len(lines):
-                size = len(lines) - idx
-            chunks.append('\n'.join(lines[idx:idx+size]))
-            idx += size
-        chunks.append('\n'.join(lines[idx:]))
+        if num_chunks == 1:
+            chunks.append(full_code)
+        else:
+            # Randomly split lines
+            idx = 0
+            for i in range(num_chunks - 1):
+                remaining = len(lines) - idx
+                # choose a size that leaves at least one line for the last chunk
+                max_size = max(1, remaining - (num_chunks - i - 1))
+                size = random.randint(1, max_size)
+                chunks.append('\n'.join(lines[idx:idx+size]))
+                idx += size
+            chunks.append('\n'.join(lines[idx:]))
 
-        # Step 3: encrypt each chunk with its own encryptor
+        # 3. Encrypt each chunk with its own encryptor
         chunk_parts = []
         self.encryptors = []
         for chunk in chunks:
             if not chunk.strip():
                 continue
             enc = ChunkEncryptor(self.rn, self.bx, self.bo, self.ba, self.bl, self.br, self.sch, self.tcat)
-            # Process tokens of this chunk
             chunk_toks = self.literals(tokenize(chunk), enc)
             chunk_body = join_toks(chunk_toks)
-            # Generate runtime for this chunk
-            chunk_runtime = enc.runtime()
-            # Wrap the chunk_body with a function that executes it
-            # We'll create a function that when called will run the code.
-            # To avoid loadstring, we'll just concatenate the body (it's already source)
-            # But we need to preserve the chunk's code; we'll put it inside a function and call it.
-            # However, we want each chunk to be decoded and then executed in order.
-            # So we'll produce a decoder that returns the decoded source, and then we'll loadstring it.
-            # To avoid using loadstring for each chunk, we can combine them.
-            # But for decentralization, we can have each chunk decoded into a string and then
-            # concatenated and loadstring once at the end.
-            # Actually, we want each chunk to be self-contained. We'll have each decoder return the decoded string,
-            # and then we concatenate them in order and execute.
-            # So we generate a function `dec_chunk_i` that returns the decoded chunk.
-            # Then at the bottom we do: `loadstring(dec_1()..dec_2()..dec_3())()`
-            # This spreads control across multiple functions.
-
-            # We'll extract the decoder function name from the runtime (it's enc.dec).
-            # The runtime defines `enc.dec` as a function that takes an index (always 0 for single blob).
-            # We'll add a wrapper that calls it with 0.
-            dec_func_name = enc.dec
-            # We'll store the chunk source as a string literal in the blob.
-            # But we need to store it as a single blob. Since we used `add`, it's a single blob.
-            # So dec_func_name(0) returns the decoded source of that chunk.
-            chunk_parts.append(dec_func_name + "(0)")
+            # We don't need to execute the chunk body separately; we'll decode it as a string.
+            # The encryptor's `add` method already placed the chunk's source in a blob,
+            # and `enc.dec(0)` will return the decoded string.
+            chunk_parts.append(enc.dec + "(0)")
             self.encryptors.append(enc)
 
-        # Step 4: build the main runner
-        # We need to define all decoders, then combine their outputs.
+        # 4. Generate all decoders
         decoders_code = []
         for enc in self.encryptors:
             decoders_code.append(enc.runtime())
 
-        # Build the main body: combine chunks and loadstring
-        # We'll also add table layer and junk at the top level
+        # 5. Build the main runner: collect decoded strings, concatenate, loadstring and execute
+        # We'll use a table to hold the chunks, then concat.
+        # To avoid global pollution, everything is local.
+        # We'll also include a pcall for error handling.
+        collect = (
+            "local _chunks={" + ",".join(chunk_parts) + "}\n"
+            "local _full=" + self.tcat + "(_chunks)\n"
+            "local _fn, _err=loadstring(_full)\n"
+            "if not _fn then error(_err,0) end\n"
+            "_fn()"
+        )
+
+        # 6. Combine everything: aliases + decoders + table layer + junk + num_pool + collect
+        aliases = self.aliases()
         table_layer = self.table_layer()
         junk_code = self.junk(4)
         num_pool = self.num_pool_runtime()
-        aliases = self.aliases()
 
-        # Combine chunks: `local result = ` + concat of chunk parts
-        # We'll use a table to collect them and then concat.
-        combine = "local _chunks={" + ",".join(chunk_parts) + "} local _full=table.concat(_chunks) local _fn, _err=loadstring(_full) if not _fn then error(_err,0) end _fn()"
-
-        # Assemble final: all decoders + table_layer + junk + combine
-        all_code = "\n".join(decoders_code) + "\n" + table_layer + "\n" + junk_code + "\n" + num_pool + "\n" + combine
-
-        # Wrap in IIFE and add aliases
+        all_code = "\n".join(decoders_code) + "\n" + table_layer + "\n" + junk_code + "\n" + num_pool + "\n" + collect
         final_code = aliases + "(function() " + all_code + " end)()"
 
+        # 7. Minify and add header
         return HEADER + "\n" + minify(final_code)
+
 
 # -----------------------------------------------------------------------------
 # DISCORD COG
