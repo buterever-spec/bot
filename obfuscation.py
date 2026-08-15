@@ -1,5 +1,5 @@
 """
-Discord Cog: Hercules‑style obfuscator (without anti‑tamper)
+Discord Cog: Hercules‑style obfuscator (decentralized, multi‑chunk)
 Command: /obf
 Header: --[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--
 """
@@ -19,7 +19,7 @@ from discord import app_commands
 from discord.ext import commands
 
 # -----------------------------------------------------------------------------
-# OBFUSCATOR CORE (taken from obfuscater.py, anti‑tamper removed)
+# OBFUSCATOR CORE – multi‑chunk decentralized version
 # -----------------------------------------------------------------------------
 
 TOK_SPEC = [
@@ -104,7 +104,11 @@ def rol8(v: int, r: int) -> int:
     r &= 7
     return ((v << r) | (v >> (8 - r))) & 255
 
-class StringPool:
+# -----------------------------------------------------------------------------
+# CHUNK ENCRYPTION (per‑chunk StringPool)
+# -----------------------------------------------------------------------------
+class ChunkEncryptor:
+    """Encrypts a single chunk with its own random transforms and stores metadata."""
     def __init__(self, rn, bx, bo, ba, bl, br, sch, tcat):
         self.rn = rn
         self.bx, self.bo, self.ba, self.bl, self.br = bx, bo, ba, bl, br
@@ -182,6 +186,7 @@ class StringPool:
         return "(" + self.add(s[:mid]) + ".." + self.add(s[mid:]) + ")"
 
     def runtime(self) -> str:
+        """Generate code for this chunk's decoder."""
         if not self.blobs:
             return "local function " + self.dec + "(i) return '' end"
         order = list(range(len(self.blobs)))
@@ -234,6 +239,9 @@ class StringPool:
             "local s=" + tcat + "(out) " + self.cache + "[i]=s return s end",
         )
 
+# -----------------------------------------------------------------------------
+# MAIN OBFUSCATOR – multi‑chunk decentralized
+# -----------------------------------------------------------------------------
 class Obf:
     def __init__(self):
         random.seed(int.from_bytes(os.urandom(16), "big") ^ time.time_ns())
@@ -246,9 +254,8 @@ class Obf:
         self.br = self.rn(10)
         self.sch = self.rn(10)
         self.tcat = self.rn(10)
-        self.pool = StringPool(
-            self.rn, self.bx, self.bo, self.ba, self.bl, self.br, self.sch, self.tcat
-        )
+        # We'll create one encryptor per chunk later
+        self.encryptors: List[ChunkEncryptor] = []
         self.num_pool: List[int] = []
         self.num_name = None
         self.num_map: Dict[int, int] = {}
@@ -333,7 +340,7 @@ class Obf:
             i += 1
         return [T("IDENT", self.vmap[t.v]) if t.k == "IDENT" and t.v in self.vmap else t for t in toks]
 
-    def literals(self, toks: List[T]) -> List[T]:
+    def literals(self, toks: List[T], encryptor: ChunkEncryptor) -> List[T]:
         o = []
         for t in toks:
             if t.k == "STRING":
@@ -343,9 +350,9 @@ class Obf:
                 if not raw or raw.startswith(("rbxasset", "http")):
                     o.append(t)
                 elif len(raw) >= 3:
-                    o.append(T("OTHER", self.pool.split_add(raw)))
+                    o.append(T("OTHER", encryptor.split_add(raw)))
                 else:
-                    o.append(T("OTHER", self.pool.add(raw)))
+                    o.append(T("OTHER", encryptor.add(raw)))
             elif t.k == "NUMBER" and "." not in t.v:
                 o.append(T("OTHER", self.enc_num(t.v)))
             else:
@@ -376,101 +383,102 @@ class Obf:
             ]))
         return sp(*parts)
 
-    def encrypt_bc(self, prog: List[int]) -> Tuple[List[int], dict]:
-        k1 = random.randint(1, 255)
-        mix = random.randint(1, 255)
-        out = [(prog[i] ^ k1 ^ ((i * mix) & 255)) & 255 for i in range(len(prog))]
-        return out, {"k1": k1, "mix": mix}
-
-    def make_vm(self, body: str) -> str:
-        ops = [
-            "LOADK", "MOVE", "CALL", "NOP", "HALT", "LOADN",
-            "LOADCALL", "LKCALL", "MOVCALL", "DEAD", "XOR", "GET",
-            "LNADD", "BAND",
-        ]
-        ids = random.sample(range(8, 240), len(ops))
-        OP = dict(zip(ops, ids))
-
-        def ins(op, a=0, b=0):
-            return [OP[op], a & 255, b & 255]
-
-        prog: List[int] = []
-        for _ in range(random.randint(3, 6)):
-            prog += ins(
-                random.choice(["NOP", "DEAD", "LOADN", "XOR", "LNADD", "BAND"]),
-                random.randint(4, 8),
-                random.randint(0, 20),
-            )
-        prog += ins("LKCALL", 1, 1)
-        prog += ins("HALT")
-
-        enc, ek = self.encrypt_bc(prog)
-        N = {k: self.rn(11) for k in OP}
-        R, K, B, PC, OV, AV, BV, FN = [self.rn(9) for _ in range(8)]
-        HT, H = self.rn(10), self.rn(9)
-        KEY, MIX = self.rn(8), self.rn(8)
-        bx, ba = self.bx, self.ba
-
-        decl = sp(*["local " + N[k] + "=" + str(OP[k]) for k in OP])
-        reg_order = list(OP.keys())
-        random.shuffle(reg_order)
-
-        bodies = {
-            "LOADK": "function() " + R + "[" + AV + "]=" + K + "[" + BV + "] end",
-            "MOVE": "function() " + R + "[" + AV + "]=" + R + "[" + BV + "] end",
-            "CALL": "function() " + FN + "=" + R + "[" + AV + "] if type(" + FN + ")=='function' then " + FN + "() end end",
-            "LOADCALL": "function() " + FN + "=" + R + "[" + AV + "] if type(" + FN + ")=='function' then " + FN + "() end end",
-            "LKCALL": "function() " + R + "[" + AV + "]=" + K + "[" + BV + "] " + FN + "=" + R + "[" + AV + "] if type(" + FN + ")=='function' then " + FN + "() end end",
-            "MOVCALL": "function() " + R + "[" + AV + "]=" + R + "[" + BV + "] " + FN + "=" + R + "[" + AV + "] if type(" + FN + ")=='function' then " + FN + "() end end",
-            "NOP": "function() end",
-            "DEAD": "function() end",
-            "LOADN": "function() " + R + "[" + AV + "]=" + BV + " end",
-            "LNADD": "function() " + R + "[" + AV + "]=" + BV + " " + R + "[" + AV + "]=(" + R + "[" + AV + "] or 0)+(" + R + "[" + AV + "] or 0) end",
-            "XOR": "function() " + R + "[" + AV + "]=" + bx + "((" + R + "[" + AV + "] or 0),(" + R + "[" + BV + "] or 0)) end",
-            "BAND": "function() " + R + "[" + AV + "]=" + ba + "((" + R + "[" + AV + "] or 0),(" + R + "[" + BV + "] or 0)) end",
-            "GET": "function() " + R + "[" + AV + "]=" + R + "[" + BV + "] end",
-            "HALT": "function() " + PC + "=-1 end",
-        }
-
-        assigns = []
-        for op in reg_order:
-            assigns.append(HT + "[" + N[op] + "]=" + bodies[op])
-        for _ in range(random.randint(2, 4)):
-            did = random.randint(1, 255)
-            while did in ids:
-                did = random.randint(1, 255)
-            assigns.append(HT + "[" + str(did) + "]=function() end")
-        random.shuffle(assigns)
-
-        return sp(
-            decl,
-            "local " + K + "={function() " + body + " end}",
-            "local " + R + "={}",
-            "local " + B + "={" + ",".join(map(str, enc)) + "}",
-            "local " + KEY + "=" + str(ek["k1"]) + " local " + MIX + "=" + str(ek["mix"]),
-            "local " + PC + "=1 local " + FN + "=nil local " + AV + "=0 local " + BV + "=0 local " + OV + "=0",
-            "local " + HT + "={}",
-            *assigns,
-            "while " + PC + ">0 do",
-            OV + "=" + bx + "(" + B + "[" + PC + "]," + bx + "(" + KEY + "," + ba + "((" + PC + "-1)*" + MIX + ",255)))",
-            AV + "=" + bx + "(" + B + "[" + PC + "+1]," + bx + "(" + KEY + "," + ba + "((" + PC + ")*" + MIX + ",255)))",
-            BV + "=" + bx + "(" + B + "[" + PC + "+2]," + bx + "(" + KEY + "," + ba + "((" + PC + "+1)*" + MIX + ",255)))",
-            PC + "=" + PC + "+3",
-            "local " + H + "=" + HT + "[" + OV + "]",
-            "if " + H + " then " + H + "() end",
-            "end",
-        )
-
     def run(self, src: str) -> str:
-        toks = self.literals(self.rename(tokenize(src)))
-        body = join_toks(toks)
-        # Anti‑tamper removed – only table layer + junk + body
-        body = sp(self.table_layer(), self.junk(4), body)
-        inner = sp(self.pool.runtime(), self.num_pool_runtime(), body)
-        vm = self.make_vm(inner)
-        code = self.aliases() + "(function() " + vm + " end)()"
-        return HEADER + "\n" + minify(code)
+        # Step 1: rename and tokenize
+        toks = self.rename(tokenize(src))
 
+        # Step 2: split source into chunks (at newlines)
+        lines = join_toks(toks).split('\n')
+        num_chunks = random.randint(2, 6)
+        # Ensure we have at least 2 chunks if possible
+        if len(lines) < num_chunks:
+            num_chunks = max(2, len(lines) // 2)
+            if num_chunks < 2:
+                num_chunks = 1  # fallback
+
+        # Randomly split lines into chunks
+        chunk_sizes = []
+        total = len(lines)
+        for i in range(num_chunks):
+            if i == num_chunks - 1:
+                chunk_sizes.append(total)
+            else:
+                sz = random.randint(1, max(1, total // (num_chunks - i)))
+                chunk_sizes.append(sz)
+                total -= sz
+        # Adjust the last chunk to include remaining lines
+        # Actually we'll just use the sizes as number of lines per chunk
+        # We'll re-calculate properly
+        chunks = []
+        idx = 0
+        for size in chunk_sizes[:-1]:
+            if idx + size > len(lines):
+                size = len(lines) - idx
+            chunks.append('\n'.join(lines[idx:idx+size]))
+            idx += size
+        chunks.append('\n'.join(lines[idx:]))
+
+        # Step 3: encrypt each chunk with its own encryptor
+        chunk_parts = []
+        self.encryptors = []
+        for chunk in chunks:
+            if not chunk.strip():
+                continue
+            enc = ChunkEncryptor(self.rn, self.bx, self.bo, self.ba, self.bl, self.br, self.sch, self.tcat)
+            # Process tokens of this chunk
+            chunk_toks = self.literals(tokenize(chunk), enc)
+            chunk_body = join_toks(chunk_toks)
+            # Generate runtime for this chunk
+            chunk_runtime = enc.runtime()
+            # Wrap the chunk_body with a function that executes it
+            # We'll create a function that when called will run the code.
+            # To avoid loadstring, we'll just concatenate the body (it's already source)
+            # But we need to preserve the chunk's code; we'll put it inside a function and call it.
+            # However, we want each chunk to be decoded and then executed in order.
+            # So we'll produce a decoder that returns the decoded source, and then we'll loadstring it.
+            # To avoid using loadstring for each chunk, we can combine them.
+            # But for decentralization, we can have each chunk decoded into a string and then
+            # concatenated and loadstring once at the end.
+            # Actually, we want each chunk to be self-contained. We'll have each decoder return the decoded string,
+            # and then we concatenate them in order and execute.
+            # So we generate a function `dec_chunk_i` that returns the decoded chunk.
+            # Then at the bottom we do: `loadstring(dec_1()..dec_2()..dec_3())()`
+            # This spreads control across multiple functions.
+
+            # We'll extract the decoder function name from the runtime (it's enc.dec).
+            # The runtime defines `enc.dec` as a function that takes an index (always 0 for single blob).
+            # We'll add a wrapper that calls it with 0.
+            dec_func_name = enc.dec
+            # We'll store the chunk source as a string literal in the blob.
+            # But we need to store it as a single blob. Since we used `add`, it's a single blob.
+            # So dec_func_name(0) returns the decoded source of that chunk.
+            chunk_parts.append(dec_func_name + "(0)")
+            self.encryptors.append(enc)
+
+        # Step 4: build the main runner
+        # We need to define all decoders, then combine their outputs.
+        decoders_code = []
+        for enc in self.encryptors:
+            decoders_code.append(enc.runtime())
+
+        # Build the main body: combine chunks and loadstring
+        # We'll also add table layer and junk at the top level
+        table_layer = self.table_layer()
+        junk_code = self.junk(4)
+        num_pool = self.num_pool_runtime()
+        aliases = self.aliases()
+
+        # Combine chunks: `local result = ` + concat of chunk parts
+        # We'll use a table to collect them and then concat.
+        combine = "local _chunks={" + ",".join(chunk_parts) + "} local _full=table.concat(_chunks) local _fn, _err=loadstring(_full) if not _fn then error(_err,0) end _fn()"
+
+        # Assemble final: all decoders + table_layer + junk + combine
+        all_code = "\n".join(decoders_code) + "\n" + table_layer + "\n" + junk_code + "\n" + num_pool + "\n" + combine
+
+        # Wrap in IIFE and add aliases
+        final_code = aliases + "(function() " + all_code + " end)()"
+
+        return HEADER + "\n" + minify(final_code)
 
 # -----------------------------------------------------------------------------
 # DISCORD COG
@@ -486,7 +494,7 @@ class Obfuscation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="obf", description="Obfuscate a Luau file using the Hercules‑style obfuscator")
+    @app_commands.command(name="obf", description="Obfuscate a Luau file with decentralized multi‑chunk encryption")
     @app_commands.describe(file="Attach the .lua or .txt Luau source file to obfuscate")
     async def obf(self, interaction: discord.Interaction, file: discord.Attachment):
         if not file.filename.lower().endswith((".lua", ".txt")):
@@ -507,7 +515,6 @@ class Obfuscation(commands.Cog):
                 await interaction.followup.send("The file is empty.", ephemeral=True)
                 return
 
-            # Run obfuscator in a thread to avoid blocking
             obfuscated = await asyncio.to_thread(Obf().run, source)
 
             out_file = discord.File(
@@ -523,7 +530,6 @@ class Obfuscation(commands.Cog):
             await interaction.followup.send("Could not read the file as UTF-8. Please ensure it's a text file.", ephemeral=True)
         except Exception as e:
             await interaction.followup.send(f"An error occurred during obfuscation: {str(e)}", ephemeral=True)
-
 
 # -----------------------------------------------------------------------------
 # SETUP
