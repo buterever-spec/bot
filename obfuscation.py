@@ -282,8 +282,10 @@ def _pack_meta(split, seed, add, step, blk, rot, rev):
     return (split & 0xF) | ((seed & 0xFF) << 4) | ((add & 0xFF) << 12) | ((step & 0x1F) << 20) | ((blk & 0xFF) << 25) | ((rot & 0x7) << 33) | ((rev & 0x1) << 36)
 
 def _encrypt_string(plain: str, seed: int) -> dict:
+    # plain must be a string literal (with quotes or brackets)
     bytes_ = _literal_bytes(plain)
-    if bytes_ is None: raise ValueError("Invalid string literal")
+    if bytes_ is None:
+        raise ValueError(f"Invalid string literal: {plain}")
     n = len(bytes_)
     if n == 0: return {"chunks": [[]], "meta": 0, "chk": 2166136261, "len": 0}
     rng = random.Random(seed)
@@ -318,11 +320,9 @@ def _replace_globals(tokens: List[Token], global_map: Dict[str, int], lookup_nam
                 # ensure not preceded by '.' or ':' (method call)
                 if i > 0 and tokens[i-1].value not in ('.', ':'):
                     # replace with lookup_name[decode(idx)]
-                    # We'll use the global map to get the index
                     idx = global_map[t.value]
                     out.append(Token(TokenKind.IDENTIFIER, lookup_name, t.line, t.col))
                     out.append(Token(TokenKind.SYMBOL, "[", t.line, t.col))
-                    # We need to decode the name; we'll add a placeholder that will be replaced later
                     out.append(Token(TokenKind.IDENTIFIER, f"__G{idx}__", t.line, t.col))
                     out.append(Token(TokenKind.SYMBOL, "]", t.line, t.col))
                     i += 1
@@ -461,9 +461,8 @@ def obfuscate_luau(source: str) -> str:
     # We'll add the global names as strings to the records
     global_strings = {}
     for name, idx in global_map.items():
-        # We'll encrypt the name and store it
-        enc = _encrypt_string(name, secrets.randbelow(0xFFFFFFFF))
-        # We'll store the index of the record for each global name
+        # IMPORTANT: wrap the name in quotes so _literal_bytes can parse it
+        enc = _encrypt_string('"' + name + '"', secrets.randbelow(0xFFFFFFFF))
         global_strings[idx] = len(records)
         records.append(enc)
 
@@ -475,7 +474,7 @@ def obfuscate_luau(source: str) -> str:
         elif t.kind == TokenKind.IDENTIFIER and t.value.startswith("__G") and t.value.endswith("__"):
             # This is a global placeholder like __G1__
             idx = int(t.value[3:-2])
-            # Replace with decode(record_index)
+            # Replace with lookup_name[decode(record_index)]
             rec_idx = global_strings[idx]
             out_tokens.append(f"{lookup_name}[{rec_idx}]")
         elif t.kind in (TokenKind.NUMBER, TokenKind.HEX_NUMBER):
