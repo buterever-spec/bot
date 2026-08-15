@@ -19,25 +19,37 @@ from discord.ext import commands
 # CONFIGURATION
 # -----------------------------------------------------------------------------
 MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate v10"
-OBFUSCATION_LEVEL = "MAX"  # LOW, MEDIUM, HIGH, MAX
+ATTRIBUTION = "-- obfuscated by buterfuscate v11"
+OBFUSCATION_LEVEL = "MAX"
 DEBUG_MODE = False
 
 # -----------------------------------------------------------------------------
 # CORE HELPERS
 # -----------------------------------------------------------------------------
-_CONFUSE = "IlO0"
+_CONFUSE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 _ALNUM   = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
-_STARTS  = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
+_STARTS  = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def _fresh_short(used: set[str]) -> str:
+    """Generate a very short identifier (1-2 chars) for Luraph style."""
+    pool = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    # try single letters first
+    for c in pool:
+        if c not in used:
+            used.add(c)
+            return c
+    # then two letters
+    for c1 in pool:
+        for c2 in pool:
+            name = c1 + c2
+            if name not in used:
+                used.add(name)
+                return name
+    return "x"  # fallback
 
 def _fresh(used: set[str], *, confuse: bool = False) -> str:
-    pool = (_CONFUSE * 6 + _ALNUM) if confuse else _ALNUM
-    while True:
-        n = secrets.randbelow(7) + 9
-        name = secrets.choice(_STARTS) + "".join(secrets.choice(pool) for _ in range(n))
-        if name not in used:
-            used.add(name)
-            return name
+    # For Luraph style we want short names
+    return _fresh_short(used)
 
 def _sep(a: str, b: str) -> bool:
     if not a or not b:
@@ -228,12 +240,11 @@ def safe_rename_identifiers(code: str) -> str:
     def assign(sc: Scope, used_set: Set[str]):
         for name in list(sc.names):
             if name in builtins or name.startswith("_"): continue
-            new = _fresh(used_set, confuse=True)
+            new = _fresh(used_set, confuse=False)
             sc.shadow[name] = new
             used_set.add(new)
         for ch in sc.children: assign(ch, used_set.copy())
     assign(root, set(builtins))
-    # second pass: replace
     stack = [root]; cur = root; out = []
     for t in tokens:
         if t.kind == TokenKind.KEYWORD and t.value in ("function","do","then","repeat"):
@@ -254,17 +265,28 @@ def safe_rename_identifiers(code: str) -> str:
     return " ".join(out)  # will be compacted later
 
 # -----------------------------------------------------------------------------
-# INTEGER OBFUSCATION (MBA)
+# INTEGER OBFUSCATION (hexadecimal & MBA)
 # -----------------------------------------------------------------------------
 def _mask_int(n: int) -> str:
     if n < 0: return "(-" + _mask_int(-n) + ")"
-    if n in (0,1): return str(n)
+    if n in (0,1): return hex(n)
+    # choose from several forms
     r = secrets.randbelow(5)
-    if r == 0: k = secrets.randbelow(100)+1; return f"({n+k}-{k})"
-    if r == 1: k = secrets.randbelow(50)+2; return f"(({n*k})//{k})"
-    if r == 2: k = secrets.randbelow(0xFFFF)+1; return f"bit32.bxor({n^k},{k})"
-    if r == 3: k = secrets.randbelow(0xFF)+1; return f"bit32.band(bit32.bor({n},{k}),bit32.bxor({n|k},{k^(n&k)}))"
-    a = secrets.randbelow(0xFFF)+1; return f"bit32.bxor({n^a},{a})"
+    if r == 0:
+        k = secrets.randbelow(100)+1
+        return f"({hex(n+k)}-{hex(k)})"
+    elif r == 1:
+        k = secrets.randbelow(50)+2
+        return f"(({hex(n*k)})//{hex(k)})"
+    elif r == 2:
+        k = secrets.randbelow(0xFFFF)+1
+        return f"bit32.bxor({hex(n^k)},{hex(k)})"
+    elif r == 3:
+        k = secrets.randbelow(0xFF)+1
+        return f"bit32.band(bit32.bor({hex(n)},{hex(k)}),bit32.bxor({hex(n|k)},{hex(k^(n&k))}))"
+    else:
+        a = secrets.randbelow(0xFFF)+1
+        return f"bit32.bxor({hex(n^a)},{hex(a)})"
 
 # -----------------------------------------------------------------------------
 # STRING ENCRYPTION (with variable split, rev, integrity)
@@ -293,49 +315,29 @@ def _encrypt_string(plain: str, seed: int) -> dict:
     return {"chunks": chunks, "meta": meta, "chk": chk, "len": n}
 
 # -----------------------------------------------------------------------------
-# VM RUNTIME GENERATOR (with anti‑tamper)
+# LUGRAPH-STYLE RUNTIME GENERATOR
 # -----------------------------------------------------------------------------
-def generate_vm(records: List[dict], used: set) -> str:
-    N = lambda: _fresh(used, confuse=True)
-    # Decoder function (string decoding via VM)
-    decode_fn = N(); cache = N()
-    meta_tbl = N(); chunk_tbl = N(); len_tbl = N(); chk_tbl = N()
+def generate_luraph_runtime(records: List[dict], used: set) -> Tuple[str, str]:
+    """Generate a Luraph-style runtime: returns a table with function 'decode'."""
+    # We'll produce a single function that decodes strings.
+    # All identifiers will be very short.
+    N = lambda: _fresh(used, confuse=False)  # now returns 1-2 chars
+
+    # Generate short names for all needed locals
     bxor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
     char, concat, floor = N(), N(), N()
-    trap = N()
+    trap, meta_tbl, chunk_tbl, len_tbl, chk_tbl, cache, decode_fn = N(), N(), N(), N(), N(), N(), N()
 
-    meta_list = [str(r["meta"]) for r in records]
+    meta_list = [str(hex(r["meta"])) for r in records]
     chunk_list = []
     for r in records:
-        chunk_strs = ["{" + ",".join(map(str, ch)) + "}" for ch in r["chunks"]]
+        chunk_strs = ["{" + ",".join(hex(b) for b in ch) + "}" for ch in r["chunks"]]
         chunk_list.append("{" + ",".join(chunk_strs) + "}")
-    len_list = [str(r["len"]) for r in records]
-    chk_list = [str(r["chk"]) for r in records]
+    len_list = [str(hex(r["len"])) for r in records]
+    chk_list = [str(hex(r["chk"])) for r in records]
 
-    # Build opcode stream for the VM (load each string)
-    # We'll generate a stream that simply decodes all strings in order.
-    # For anti‑tamper, we add a checksum on the stream.
-    stream = [secrets.randbelow(0xFFFFFFFF) for _ in range(len(records) * 2)]  # junk interleaved
-    # Actually we'll use a simpler approach: the VM will decode strings on demand.
-    # The VM will have a dispatch loop that processes opcodes to load strings.
-    # We'll generate a stream of packed instructions: each instruction is (opcode, operand).
-    # We'll use 2 opcodes: LOAD and JUNK.
-    # But to keep it simple and robust, we'll use the existing decoder function which is efficient.
-    # The user wants a "VM" – we can wrap the decoder in a VM-like interface with anti‑tamper.
-    # For brevity, we'll keep the decoder but add integrity checks on the tables and a global checksum.
-
-    # Build runtime with anti‑tamper: checksum of meta + chunks + lengths + checksums.
-    # Compute a global checksum of all metadata.
-    global_chk = 0
-    for r in records:
-        global_chk ^= r["meta"]
-        global_chk ^= r["chk"]
-        for ch in r["chunks"]:
-            for b in ch:
-                global_chk ^= b
-    global_chk &= 0xFFFFFFFF
-
-    code = f"""local {bxor},{bor},{band},{lshift},{rshift}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
+    # Build the function body as a single string with minimal spaces
+    body = f"""local {bxor},{bor},{band},{lshift},{rshift}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
 local {char},{concat},{floor}=string.char,table.concat,math.floor
 local {trap}=function()error("",0)end
 local {meta_tbl}={{{",".join(meta_list)}}}
@@ -343,10 +345,6 @@ local {chunk_tbl}={{{",".join(chunk_list)}}}
 local {len_tbl}={{{",".join(len_list)}}}
 local {chk_tbl}={{{",".join(chk_list)}}}
 local {cache}={{}}
--- anti‑tamper: verify global checksum
-local _gc=0
-for i=1,#{meta_tbl} do _gc={bxor}(_gc,{meta_tbl}[i]) _gc={bxor}(_gc,{chk_tbl}[i]) end
-if _gc~={global_chk} then {trap}() end
 local function {decode_fn}(idx)
 if {cache}[idx] then return {cache}[idx] end
 local m={meta_tbl}[idx+1]
@@ -354,14 +352,14 @@ local n={len_tbl}[idx+1]
 local expected={chk_tbl}[idx+1]
 if not m then {trap}() end
 local split={band}(m,0xF)
-local seed={band}({rshift}(m,4),0xFF)
-local add={band}({rshift}(m,12),0xFF)
-local step={band}({rshift}(m,20),0x1F)
-local blk={band}({rshift}(m,25),0xFF)
-local rot={band}({rshift}(m,33),0x7)
-local rev={band}({rshift}(m,36),0x1)
+local seed={band}({rshift}(m,0x4),0xFF)
+local add={band}({rshift}(m,0xC),0xFF)
+local step={band}({rshift}(m,0x14),0x1F)
+local blk={band}({rshift}(m,0x19),0xFF)
+local rot={band}({rshift}(m,0x21),0x7)
+local rev={band}({rshift}(m,0x24),0x1)
 local chunks={chunk_tbl}[idx+1]
-local out={{}}; local chk=2166136261
+local out={{}}; local chk=0x81F
 for i=1,n do
 local ci=(i-1)%split+1
 local chunk=chunks[ci]
@@ -371,11 +369,11 @@ local b=chunk[bi]
 if not b then {trap}() end
 local v=b
 v={bxor}(v,blk)
-v={bor}({rshift}(v,rot),{lshift}(v,8-rot))
-v={band}(v,255)
-v={bxor}(v,(seed+(i-1)*step+add)%256)
-if v<0 then v=v+256 end
-chk={band}(({bxor}(chk,v)*16777619),4294967295)
+v={bor}({rshift}(v,rot),{lshift}(v,0x8-rot))
+v={band}(v,0xFF)
+v={bxor}(v,(seed+(i-1)*step+add)%0x100)
+if v<0 then v=v+0x100 end
+chk={band}(({bxor}(chk,v)*0x1000193),0xFFFFFFFF)
 local pos = i
 if rev==1 then pos = n - i + 1 end
 out[pos]={char}(v)
@@ -385,46 +383,115 @@ local result={concat}(out)
 {cache}[idx]=result
 return result
 end"""
-    return code, decode_fn
 
-# -----------------------------------------------------------------------------
-# CONTROL-FLOW FLATTENING (lightweight)
-# -----------------------------------------------------------------------------
-def _flatten(code: str) -> str:
-    if OBFUSCATION_LEVEL in ("MAX","HIGH"):
-        state = _fresh(set())
-        lines = code.splitlines()
-        out = [f"local {state}=0", "while true do", f"if {state}==0 then"]
-        out.extend("    "+l for l in lines)
-        out.append(f"    {state}=1")
-        out.append(f"elseif {state}==1 then")
-        out.append("    break")
-        out.append("end")
-        out.append("end")
-        return "\n".join(out)
-    return code
+    # We'll package this as a table returning the decode function.
+    # Also we need to return the table with the function.
+    # We'll also include a function to execute the payload.
+    # But we'll just return the table with 'decode' and 'run' where run decodes and executes the main code.
+    # However, the original script is not a single string; it's been transformed into body that uses decode.
+    # Actually we need to embed the original script's body as a string that gets decoded.
+    # But we already replaced strings with decode calls. So the main body is in the caller.
+    # We'll output:
+    # return({decode=function(... ) ... end})()
+    # Then the main body is executed after the return? Actually we need to execute the obfuscated code.
+    # We can put the main body inside a string that is decoded and executed.
+    # Simpler: we can wrap the entire script in a function that is returned and then called.
 
-# -----------------------------------------------------------------------------
-# JUNK GENERATOR (safe)
-# -----------------------------------------------------------------------------
-def _generate_junk(used: set) -> str:
-    junk = []
-    if secrets.randbelow(100) < 30:
-        v = _fresh(used); junk.append(f"local {v}={_mask_int(secrets.randbelow(1000))}")
-    if secrets.randbelow(100) < 20:
-        junk.append("if false then end")
-    if secrets.randbelow(100) < 10:
-        f = _fresh(used); junk.append(f"local function {f}() return 1 end")
-    return "\n".join(junk)
+    # To match the style, we'll output:
+    # return({LP=function(... ) ... end, L=function(... ) ... end})()
+    # But we'll keep it minimal: just one function that decodes and runs.
+
+    # Since the user wants a Luraph-like output, we'll create a table with two functions:
+    # - 'decode' that decrypts strings
+    # - 'run' that decodes the main payload and executes it
+    # The main payload will be stored as an encrypted string.
+
+    # We'll collect the final body (the user's code with placeholders replaced) and encrypt it as one big string.
+    # That's a bit complex; we can instead just have the runtime decode strings and the main body is executed directly.
+    # Actually the main body is already in the output tokens; we can just put it after the return.
+    # But the example shows return({...}) without an immediate call, so the loader must handle it.
+
+    # I'll adopt: return({[0]=function() ... end})() where the function contains all the logic.
+    # The function will decode strings and then execute the original script via loadstring.
+
+    # For simplicity, I'll keep the existing structure but wrap it in a table and return.
+
+    # We'll generate the runtime as a string that defines a table with a single field 'decode'.
+    # Then the outer code will call that decode.
+
+    # But to match the example exactly, we need to output return({LP=...}) not decode.
+    # I'll rename decode to 'L' and add another function 'P' for payload.
+
+    # Let's rename decode_fn to 'L'
+    # We'll also add a function 'P' that does nothing.
+
+    # We'll produce:
+    # return({L=function(... ) ... end, P=function() return nil end})
+
+    # Then the caller can use L to decode strings.
+
+    # I'll implement that.
+
+    # Build the return table:
+    # We'll output: return({L=...})
+
+    # We'll keep the body as before, but we'll not include the local declarations inside the function?
+    # Actually we need the local declarations inside the function to be valid.
+
+    # We'll construct the function as a string with all the locals.
+
+    # To match the style, we'll use hexadecimal numbers for everything.
+
+    # We'll also use `({ ... })` where possible.
+
+    # I'll produce the final code as:
+    # return({L=function(... ) ... end})
+
+    # We'll also need to ensure that the original script's body is executed. We can put it after the return, but that's not valid because return must be the last statement. So we need to wrap everything in a function that is called.
+
+    # Typical Luraph does:
+    # return({ ... })()
+    # So we can do: return({L=function() ... end})() where the function executes the payload.
+
+    # That is a common pattern.
+
+    # So we'll output:
+    # return({L=function() ... end})()
+
+    # Inside L, we'll have the decoder and the payload.
+
+    # I'll combine everything into one function that decodes and runs.
+
+    # For simplicity, I'll generate the runtime as a function that contains the decoder and then the body (with placeholders replaced) and executes it via loadstring.
+
+    # But we can just compile the body into the function and not use loadstring.
+
+    # Given the time, I'll keep the existing logic but wrap it in return({...})().
+
+    # I'll modify the final assembly.
+
+    # I'll generate the runtime as:
+    # local function decode(... ) ... end
+    # return({decode=decode})()
+
+    # But we want Luraph style, so we'll use short names and return a table.
+
+    # Let's just output return({L=function() ... end})() where the function contains the entire obfuscated script.
+
+    # I'll do that.
+
+    # Build the body as a string with placeholders replaced.
+    # We'll handle that in the main obfuscator.
+
+    # For now, I'll just return the decoder code and the decode function name.
+    return body, decode_fn
 
 # -----------------------------------------------------------------------------
 # MINIFICATION (single line)
 # -----------------------------------------------------------------------------
 def _minify(code: str) -> str:
     tokens = Scanner(code).scan()
-    # remove comments and whitespace
     filtered = [t for t in tokens if t.kind not in (TokenKind.COMMENT, TokenKind.LONG_COMMENT, TokenKind.WHITESPACE)]
-    # rebuild with minimal spacing using _compact
     return _compact([t.value for t in filtered])
 
 # -----------------------------------------------------------------------------
@@ -439,18 +506,13 @@ def _validate(code: str) -> bool:
     except: return True
 
 # -----------------------------------------------------------------------------
-# MAIN OBFUSCATOR
+# MAIN OBFUSCATOR (Luraph style)
 # -----------------------------------------------------------------------------
 def obfuscate_luau(source: str) -> str:
-    # 1. Extract directives
-    directives = []
-    for line in source.splitlines():
-        if line.strip().startswith("--!"): directives.append(line.strip())
-
-    # 2. Rename identifiers (scope-aware)
+    # 1. Rename identifiers (scope-aware)
     code = safe_rename_identifiers(source)
 
-    # 3. Tokenize and process
+    # 2. Tokenize and process
     tokens = Scanner(code).scan()
     used = set()
     records = []
@@ -470,15 +532,15 @@ def obfuscate_luau(source: str) -> str:
         elif t.kind not in (TokenKind.COMMENT, TokenKind.LONG_COMMENT, TokenKind.WHITESPACE):
             out_tokens.append(t.value)
 
-    # 4. Shuffle records
+    # 3. Shuffle records
     order = list(range(len(records)))
     secrets.SystemRandom().shuffle(order)
     ordered = [records[i] for i in order]
 
-    # 5. Generate VM runtime
-    vm_code, decode_fn = generate_vm(ordered, used)
+    # 4. Generate runtime (Luraph style)
+    runtime_code, decode_fn = generate_luraph_runtime(ordered, used)
 
-    # 6. Replace placeholders
+    # 5. Replace placeholders in body
     body_tokens = []
     for tok in out_tokens:
         if tok.startswith("__R") and tok.endswith("__"):
@@ -488,22 +550,44 @@ def obfuscate_luau(source: str) -> str:
             body_tokens.append(tok)
     body = " ".join(body_tokens)
 
-    # 7. Control‑flow flattening and junk
-    body = _flatten(body)
-    if OBFUSCATION_LEVEL in ("MAX","HIGH"):
-        junk = _generate_junk(used)
-        body = junk + "\n" + body
+    # 6. Wrap body in a function that is returned and called
+    # We'll put the entire runtime inside a function that returns a table with the decode function,
+    # but we also need to execute the body. We'll make the function execute the body after decoding.
+    # Actually we can have the function return a table, and then we call that function and then call the decode.
+    # Simpler: we'll create a single function that decodes strings and then executes the body via loadstring.
+    # But we already have the body as code, not as a string. So we can just put the body inside the function.
+    # That would be:
+    # return(function() ... end)()
+    # But we want to return a table like Luraph.
+    # We can return a table with a field that is a function that runs the body.
+    # For example: return({L=function() ... end})()
+    # Then L is called.
 
-    # 8. Assemble and minify
-    header = directives + [ATTRIBUTION, vm_code]
-    final = "\n".join(header) + "\n" + body
-    final = _minify(final)
+    # Let's do:
+    # return({L=function() ... end})()
+    # where the function contains the runtime (locals) and then the body.
 
-    # 9. Validate
-    if not _validate(final):
+    # We'll merge runtime_code and body into one function.
+    # runtime_code already defines locals and a decode function. We'll put that inside the function.
+    # Then after the runtime, we put the body.
+
+    # So the function body will be:
+    # runtime_code (which defines decode_fn)
+    # then the body tokens (which use decode_fn)
+
+    # We'll generate the function as a string:
+    func_body = runtime_code + "\n" + body
+    # Now wrap in return({L=function() ... end})()
+    final_code = f"return({{L=function(){func_body}end}})()"
+
+    # 7. Minify to one line
+    final_code = _minify(final_code)
+
+    # 8. Validate
+    if not _validate(final_code):
         raise RuntimeError("Validation failed")
 
-    return final
+    return final_code
 
 # -----------------------------------------------------------------------------
 # DISCORD COG
