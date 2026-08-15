@@ -67,7 +67,7 @@ async def on_ready():
 
 async def load_cogs():
     await bot.load_extension("announce")
-    await bot.load_extension("obfuscation")
+    await bot.load_extension("hercules_obfuscator")
 
 
 async def main():
