@@ -18,7 +18,7 @@ from discord.ext import commands
 # CONFIG
 # -----------------------------------------------------------------------------
 MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate v16"
+ATTRIBUTION = "-- obfuscated by buterfuscate v17"
 OBFUSCATION_LEVEL = "MAX"
 
 # -----------------------------------------------------------------------------
@@ -55,7 +55,7 @@ def _compact(tokens: list[str]) -> str:
     return "".join(out)
 
 # -----------------------------------------------------------------------------
-# ROBUST TOKENIZER
+# TOKENIZER (for minification and renaming)
 # -----------------------------------------------------------------------------
 class TokenKind:
     WHITESPACE = "whitespace"; COMMENT = "comment"; LONG_COMMENT = "long_comment"
@@ -187,71 +187,6 @@ def _literal_bytes(val: str) -> list[int] | None:
     return result
 
 # -----------------------------------------------------------------------------
-# SCOPE-AWARE RENAMING (locals only)
-# -----------------------------------------------------------------------------
-class Scope:
-    def __init__(self, parent=None):
-        self.parent = parent; self.names = set(); self.shadow = {}; self.children = []
-    def declare(self, name): self.names.add(name)
-
-def _build_scopes(tokens: List[Token]) -> Scope:
-    root = Scope(); stack = [root]; cur = root; i = 0
-    while i < len(tokens):
-        t = tokens[i]
-        if t.kind == TokenKind.KEYWORD and t.value == "local":
-            i += 1
-            while i < len(tokens) and tokens[i].kind == TokenKind.WHITESPACE: i += 1
-            while i < len(tokens):
-                if tokens[i].kind == TokenKind.IDENTIFIER:
-                    cur.declare(tokens[i].value); i += 1
-                    while i < len(tokens) and tokens[i].kind == TokenKind.WHITESPACE: i += 1
-                    if i < len(tokens) and tokens[i].value == ",":
-                        i += 1; continue
-                    else: break
-                else: break
-            continue
-        elif t.kind == TokenKind.KEYWORD and t.value in ("function","do","then","repeat"):
-            new = Scope(cur); cur.children.append(new); stack.append(new); cur = new; i += 1; continue
-        elif t.kind == TokenKind.KEYWORD and t.value in ("end","until"):
-            if len(stack) > 1: stack.pop(); cur = stack[-1]
-            i += 1; continue
-        i += 1
-    return root
-
-def _rename_locals(code: str) -> str:
-    tokens = Scanner(code).scan()
-    root = _build_scopes(tokens)
-    builtins = {"print","warn","error","require","pairs","ipairs","next","typeof","Instance",
-                "string","table","math","os","debug","_G","_ENV","getfenv","_VERSION"}
-    used = set(builtins)
-    def assign(sc, used_set):
-        for name in list(sc.names):
-            if name in builtins or name.startswith("_"): continue
-            new = _fresh(used_set, confuse=False)
-            sc.shadow[name] = new
-            used_set.add(new)
-        for ch in sc.children: assign(ch, used_set.copy())
-    assign(root, set(builtins))
-    stack = [root]; cur = root; out = []
-    for t in tokens:
-        if t.kind == TokenKind.KEYWORD and t.value in ("function","do","then","repeat"):
-            if cur.children: cur = cur.children[-1]; stack.append(cur)
-            out.append(t.value)
-        elif t.kind == TokenKind.KEYWORD and t.value in ("end","until"):
-            if len(stack) > 1: stack.pop(); cur = stack[-1]
-            out.append(t.value)
-        elif t.kind == TokenKind.IDENTIFIER:
-            resolved = False
-            for sc in reversed(stack):
-                if t.value in sc.shadow:
-                    out.append(sc.shadow[t.value]); resolved = True; break
-                elif t.value in sc.names:
-                    out.append(t.value); resolved = True; break
-            if not resolved: out.append(t.value)
-        else: out.append(t.value)
-    return " ".join(out)
-
-# -----------------------------------------------------------------------------
 # INTEGER OBFUSCATION (hex + MBA)
 # -----------------------------------------------------------------------------
 def _mask_int(n: int) -> str:
@@ -302,11 +237,11 @@ def _encrypt_string(plain: str, seed: int) -> dict:
     return {"chunks": chunks, "meta": meta, "chk": chk, "len": n}
 
 # -----------------------------------------------------------------------------
-# DECODER + LOADSTRING RUNTIME GENERATOR (native bitwise ops)
+# DECODER RUNTIME (native bitwise ops, with error printing)
 # -----------------------------------------------------------------------------
 def generate_runtime(record: dict, used: set) -> str:
     N = lambda: _fresh(used, confuse=False)
-    # Short names for locals
+    # short names
     xor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
     char, concat, floor = N(), N(), N()
     trap, meta_tbl, chunk_tbl, len_tbl, chk_tbl, cache, decode_fn = N(), N(), N(), N(), N(), N(), N()
@@ -317,7 +252,6 @@ def generate_runtime(record: dict, used: set) -> str:
     lens = [str(hex(record["len"]))]
     chks = [str(hex(record["chk"]))]
 
-    # Using native operators: ~ for xor, | for or, & for and, << and >> for shifts.
     runtime = f"""local {xor},{bor},{band},{lshift},{rshift}=function(a,b)return a~b end,function(a,b)return a|b end,function(a,b)return a&b end,function(a,b)return a<<b end,function(a,b)return a>>b end
 local {char},{concat},{floor}=string.char,table.concat,math.floor
 local {trap}=function()error("",0)end
@@ -365,9 +299,8 @@ local result={concat}(out)
 return result
 end
 local payload={decode_fn}(0)
-local fn, err=loadstring(payload)
-if not fn then error(err,0) end
-fn()"""
+local ok, result = pcall(function() local fn, err = loadstring(payload) if not fn then error(err,0) end fn() end)
+if not ok then print("Obfuscated loader error:", result) end"""
     return runtime
 
 # -----------------------------------------------------------------------------
@@ -393,32 +326,23 @@ def _validate(code: str) -> bool:
 # MAIN OBFUSCATOR
 # -----------------------------------------------------------------------------
 def obfuscate_luau(source: str) -> str:
-    # 1. (Optional) Rename locals to make source less readable if extracted.
-    source = _rename_locals(source)
+    # 1. Escape source for double-quoted string
+    escaped = source.replace('\\', '\\\\').replace('"', '\\"')
+    source_literal = '"' + escaped + '"'
 
-    # 2. Determine a long bracket level that doesn't appear in the source.
-    eq = 0
-    while True:
-        open_bracket = "[%s[" % ("=" * eq)
-        close_bracket = "]%s]" % ("=" * eq)
-        if open_bracket not in source and close_bracket not in source:
-            break
-        eq += 1
-    source_literal = "[%s[%s]%s]" % ("=" * eq, source, "=" * eq)
-
-    # 3. Encrypt the whole source as a single string
+    # 2. Encrypt the whole source as a single string
     seed = secrets.randbelow(0xFFFFFFFF)
     encrypted = _encrypt_string(source_literal, seed)
 
-    # 4. Generate runtime that decodes and executes
+    # 3. Generate runtime that decodes and executes
     used = set()
     runtime = generate_runtime(encrypted, used)
 
-    # 5. Wrap in IIFE and minify
+    # 4. Wrap in IIFE and minify
     final = "(function()%s end)()" % runtime
     final = _minify(final)
 
-    # 6. Validate
+    # 5. Validate
     if not _validate(final):
         raise RuntimeError("Validation failed – generated code invalid")
 
