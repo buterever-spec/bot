@@ -16,37 +16,33 @@ from discord import app_commands
 from discord.ext import commands
 
 # -----------------------------------------------------------------------------
-# CONFIGURATION
+# CONFIG
 # -----------------------------------------------------------------------------
 MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate v12"
+ATTRIBUTION = "-- obfuscated by buterfuscate v14"
 OBFUSCATION_LEVEL = "MAX"
-DEBUG_MODE = False
 
 # -----------------------------------------------------------------------------
-# CORE HELPERS – generate very short identifiers (Luraph style)
+# SHORT IDENTIFIERS (Luraph style)
 # -----------------------------------------------------------------------------
 _CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 def _fresh_short(used: set[str]) -> str:
     for c in _CHARS:
         if c not in used:
-            used.add(c)
-            return c
+            used.add(c); return c
     for c1 in _CHARS:
         for c2 in _CHARS:
-            name = c1 + c2
-            if name not in used:
-                used.add(name)
-                return name
+            n = c1 + c2
+            if n not in used:
+                used.add(n); return n
     return "x"
 
-def _fresh(used: set[str], *, confuse: bool = False) -> str:
+def _fresh(used: set[str], *, confuse=False) -> str:
     return _fresh_short(used)
 
 def _sep(a: str, b: str) -> bool:
-    if not a or not b:
-        return False
+    if not a or not b: return False
     if (a[-1].isalnum() or a[-1] == "_") and (b[0].isalnum() or b[0] == "_"):
         return True
     return a.endswith("-") and b.startswith("-")
@@ -60,7 +56,7 @@ def _compact(tokens: list[str]) -> str:
     return "".join(out)
 
 # -----------------------------------------------------------------------------
-# 1. ROBUST TOKENIZER (handles ALL string/comment forms)
+# ROBUST TOKENIZER
 # -----------------------------------------------------------------------------
 class TokenKind:
     WHITESPACE = "whitespace"; COMMENT = "comment"; LONG_COMMENT = "long_comment"
@@ -70,7 +66,7 @@ class TokenKind:
 
 class Token:
     __slots__ = ("kind", "value", "line", "col")
-    def __init__(self, kind: str, value: str, line: int = 0, col: int = 0):
+    def __init__(self, kind, value, line=0, col=0):
         self.kind = kind; self.value = value; self.line = line; self.col = col
 
 class Scanner:
@@ -113,7 +109,7 @@ class Scanner:
         self.pos += 2; self.col += 2
         while self.pos < self.length and self.source[self.pos] != '\n': self.pos += 1; self.col += 1
         self.tokens.append(Token(TokenKind.COMMENT, self.source[start:self.pos], self.line, self.col))
-    def _scan_string(self, quote: str):
+    def _scan_string(self, quote):
         start = self.pos; self.pos += 1; self.col += 1
         while self.pos < self.length:
             ch = self.source[self.pos]
@@ -158,7 +154,7 @@ class Scanner:
         self.tokens.append(Token(TokenKind.SYMBOL, self.source[start:self.pos], self.line, self.col))
 
 # -----------------------------------------------------------------------------
-# 2. STRING LITERAL PARSER (exact byte extraction)
+# LITERAL BYTES
 # -----------------------------------------------------------------------------
 def _literal_bytes(val: str) -> list[int] | None:
     if val.startswith("["):
@@ -179,26 +175,25 @@ def _literal_bytes(val: str) -> list[int] | None:
             if re.fullmatch(r"[0-9a-fA-F]{2}", d):
                 result.append(int(d, 16)); i += 3; continue
         if e.isdigit():
-            d = e; c = i+1
+            d = e; c = i + 1
             while c < len(body) and len(d) < 3 and body[c].isdigit():
                 d += body[c]; c += 1
             n = int(d)
             if n > 255: return None
             result.append(n); i = c; continue
-        if e in {"\n","\r"}:
+        if e in {"\n", "\r"}:
             if e == "\r" and i + 1 < len(body) and body[i+1] == "\n": i += 1
             result.append(10); i += 1; continue
         return None
     return result
 
 # -----------------------------------------------------------------------------
-# 3. SCOPE-AWARE RENAMING (locals only, short names)
+# SCOPE-AWARE RENAMING (locals only)
 # -----------------------------------------------------------------------------
 class Scope:
-    def __init__(self, parent: Optional[Scope] = None):
-        self.parent = parent; self.names = set(); self.shadow = {}
-        self.children = []
-    def declare(self, name: str): self.names.add(name)
+    def __init__(self, parent=None):
+        self.parent = parent; self.names = set(); self.shadow = {}; self.children = []
+    def declare(self, name): self.names.add(name)
 
 def _build_scopes(tokens: List[Token]) -> Scope:
     root = Scope(); stack = [root]; cur = root; i = 0
@@ -228,9 +223,9 @@ def _rename_locals(code: str) -> str:
     tokens = Scanner(code).scan()
     root = _build_scopes(tokens)
     builtins = {"print","warn","error","require","pairs","ipairs","next","typeof","Instance",
-                "bit32","string","table","math","os","debug","_G","_ENV"}
+                "bit32","string","table","math","os","debug","_G","_ENV","getfenv","_VERSION"}
     used = set(builtins)
-    def assign(sc: Scope, used_set: Set[str]):
+    def assign(sc, used_set):
         for name in list(sc.names):
             if name in builtins or name.startswith("_"): continue
             new = _fresh(used_set, confuse=False)
@@ -258,32 +253,32 @@ def _rename_locals(code: str) -> str:
     return " ".join(out)  # will be compacted later
 
 # -----------------------------------------------------------------------------
-# 4. INTEGER OBFUSCATION (hex + MBA)
+# INTEGER OBFUSCATION (hex + MBA)
 # -----------------------------------------------------------------------------
 def _mask_int(n: int) -> str:
     if n < 0: return "(-" + _mask_int(-n) + ")"
-    if n in (0,1): return hex(n)
+    if n in (0, 1): return hex(n)
     r = secrets.randbelow(5)
     if r == 0:
-        k = secrets.randbelow(100)+1
+        k = secrets.randbelow(100) + 1
         return f"({hex(n+k)}-{hex(k)})"
     elif r == 1:
-        k = secrets.randbelow(50)+2
+        k = secrets.randbelow(50) + 2
         return f"(({hex(n*k)})//{hex(k)})"
     elif r == 2:
-        k = secrets.randbelow(0xFFFF)+1
+        k = secrets.randbelow(0xFFFF) + 1
         return f"bit32.bxor({hex(n^k)},{hex(k)})"
     elif r == 3:
-        k = secrets.randbelow(0xFF)+1
+        k = secrets.randbelow(0xFF) + 1
         return f"bit32.band(bit32.bor({hex(n)},{hex(k)}),bit32.bxor({hex(n|k)},{hex(k^(n&k))}))"
     else:
-        a = secrets.randbelow(0xFFF)+1
+        a = secrets.randbelow(0xFFF) + 1
         return f"bit32.bxor({hex(n^a)},{hex(a)})"
 
 # -----------------------------------------------------------------------------
-# 5. STRING ENCRYPTION (per‑string random transforms, exact length)
+# STRING ENCRYPTION (variable split, rev, exact length)
 # -----------------------------------------------------------------------------
-def _pack_meta(split: int, seed: int, add: int, step: int, blk: int, rot: int, rev: int) -> int:
+def _pack_meta(split, seed, add, step, blk, rot, rev):
     return (split & 0xF) | ((seed & 0xFF) << 4) | ((add & 0xFF) << 12) | ((step & 0x1F) << 20) | ((blk & 0xFF) << 25) | ((rot & 0x7) << 33) | ((rev & 0x1) << 36)
 
 def _encrypt_string(plain: str, seed: int) -> dict:
@@ -292,59 +287,43 @@ def _encrypt_string(plain: str, seed: int) -> dict:
     n = len(bytes_)
     if n == 0: return {"chunks": [[]], "meta": 0, "chk": 2166136261, "len": 0}
     rng = random.Random(seed)
-    split = rng.randint(2,5)
-    seed_val = rng.randint(1,251); add = rng.randint(0,250); step = rng.randint(1,31)
-    blk = rng.randint(1,251); rot = rng.randint(1,7); rev = rng.randint(0,1)
-    s1 = [b ^ ((seed_val + i*step + add) % 256) for i,b in enumerate(bytes_)]
-    s2 = [((b << rot) | (b >> (8-rot))) & 0xFF for b in s1]
+    split = rng.randint(2, 5)
+    seed_val = rng.randint(1, 251); add = rng.randint(0, 250); step = rng.randint(1, 31)
+    blk = rng.randint(1, 251); rot = rng.randint(1, 7); rev = rng.randint(0, 1)
+    s1 = [b ^ ((seed_val + i * step + add) % 256) for i, b in enumerate(bytes_)]
+    s2 = [((b << rot) | (b >> (8 - rot))) & 0xFF for b in s1]
     s3 = [b ^ blk for b in s2]
     if rev: s3 = s3[::-1]
     chunks = [[] for _ in range(split)]
-    for i,b in enumerate(s3): chunks[i % split].append(b)
+    for i, b in enumerate(s3): chunks[i % split].append(b)
     chk = 2166136261
     for b in bytes_: chk = ((chk ^ b) * 16777619) & 0xFFFFFFFF
     meta = _pack_meta(split, seed_val, add, step, blk, rot, rev)
     return {"chunks": chunks, "meta": meta, "chk": chk, "len": n}
 
 # -----------------------------------------------------------------------------
-# 6. GLOBAL FUNCTION LOOKUP TABLE (hide global names)
+# GLOBAL REPLACEMENT (hide global function names)
 # -----------------------------------------------------------------------------
-def _build_global_map(tokens: List[Token]) -> Dict[str, int]:
-    """Find identifiers used as function calls (not preceded by '.' or ':')."""
-    globals_used = {}
-    idx = 0
-    for i, t in enumerate(tokens):
-        if t.kind == TokenKind.IDENTIFIER:
-            # check if next non‑whitespace is '('
-            j = i + 1
-            while j < len(tokens) and tokens[j].kind == TokenKind.WHITESPACE:
-                j += 1
-            if j < len(tokens) and tokens[j].value == '(':
-                # ensure not a method call (preceded by '.' or ':')
-                if i > 0 and tokens[i-1].value not in ('.', ':'):
-                    # also check if it's a local (we'll handle later)
-                    globals_used[t.value] = 0  # placeholder
-    # assign random indices
-    names = list(globals_used.keys())
-    for name in names:
-        globals_used[name] = secrets.randbelow(0xFFFF) + 1
-    return globals_used
-
 def _replace_globals(tokens: List[Token], global_map: Dict[str, int], lookup_name: str) -> List[Token]:
     out = []
     i = 0
     while i < len(tokens):
         t = tokens[i]
         if t.kind == TokenKind.IDENTIFIER and t.value in global_map:
+            # check if it's a function call (next non-whitespace is '(')
             j = i + 1
             while j < len(tokens) and tokens[j].kind == TokenKind.WHITESPACE:
                 j += 1
             if j < len(tokens) and tokens[j].value == '(':
+                # ensure not preceded by '.' or ':' (method call)
                 if i > 0 and tokens[i-1].value not in ('.', ':'):
-                    # replace with lookup_name[index]
+                    # replace with lookup_name[decode(idx)]
+                    # We'll use the global map to get the index
+                    idx = global_map[t.value]
                     out.append(Token(TokenKind.IDENTIFIER, lookup_name, t.line, t.col))
                     out.append(Token(TokenKind.SYMBOL, "[", t.line, t.col))
-                    out.append(Token(TokenKind.NUMBER, str(global_map[t.value]), t.line, t.col))
+                    # We need to decode the name; we'll add a placeholder that will be replaced later
+                    out.append(Token(TokenKind.IDENTIFIER, f"__G{idx}__", t.line, t.col))
                     out.append(Token(TokenKind.SYMBOL, "]", t.line, t.col))
                     i += 1
                     continue
@@ -353,12 +332,11 @@ def _replace_globals(tokens: List[Token], global_map: Dict[str, int], lookup_nam
     return out
 
 # -----------------------------------------------------------------------------
-# 7. RUNTIME GENERATOR (Luraph‑style return table)
+# RUNTIME GENERATOR
 # -----------------------------------------------------------------------------
 def generate_runtime(records: List[dict], used: set, global_map: Dict[str, int]) -> Tuple[str, str]:
-    """Returns (runtime_code, decode_function_name)"""
+    """Returns (runtime_code, decode_function_name, global_lookup_name)"""
     N = lambda: _fresh(used, confuse=False)
-    # Short names for all locals
     bxor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
     char, concat, floor = N(), N(), N()
     trap, meta_tbl, chunk_tbl, len_tbl, chk_tbl, cache, decode_fn = N(), N(), N(), N(), N(), N(), N()
@@ -371,21 +349,14 @@ def generate_runtime(records: List[dict], used: set, global_map: Dict[str, int])
     len_list = [str(hex(r["len"])) for r in records]
     chk_list = [str(hex(r["chk"])) for r in records]
 
-    # Build global lookup table
+    # Global lookup table – will be used as G[decoded_name]
     lookup_name = N()
-    if global_map:
-        lookup_assigns = []
-        for name, idx in global_map.items():
-            lookup_assigns.append(f"{lookup_name}[{hex(idx)}]={name}")
-        lookup_decl = f"local {lookup_name}={{}}\n" + "\n".join(lookup_assigns)
-    else:
-        lookup_decl = ""
+    env_decl = f"local {lookup_name}=getfenv and getfenv(0) or _G or _ENV\n"
 
-    # Decoder body
     body = f"""local {bxor},{bor},{band},{lshift},{rshift}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
 local {char},{concat},{floor}=string.char,table.concat,math.floor
 local {trap}=function()error("",0)end
-{lookup_decl}
+{env_decl}
 local {meta_tbl}={{{",".join(meta_list)}}}
 local {chunk_tbl}={{{",".join(chunk_list)}}}
 local {len_tbl}={{{",".join(len_list)}}}
@@ -420,8 +391,8 @@ v={band}(v,0xFF)
 v={bxor}(v,(seed+(i-1)*step+add)%0x100)
 if v<0 then v=v+0x100 end
 chk={band}(({bxor}(chk,v)*0x1000193),0xFFFFFFFF)
-local pos = i
-if rev==1 then pos = n - i + 1 end
+local pos=i
+if rev==1 then pos=n-i+1 end
 out[pos]={char}(v)
 end
 if chk~=expected then {trap}() end
@@ -429,10 +400,10 @@ local result={concat}(out)
 {cache}[idx]=result
 return result
 end"""
-    return body, decode_fn
+    return body, decode_fn, lookup_name
 
 # -----------------------------------------------------------------------------
-# 8. MINIFICATION (one line)
+# MINIFICATION (one line)
 # -----------------------------------------------------------------------------
 def _minify(code: str) -> str:
     tokens = Scanner(code).scan()
@@ -440,7 +411,7 @@ def _minify(code: str) -> str:
     return _compact([t.value for t in filtered])
 
 # -----------------------------------------------------------------------------
-# 9. VALIDATION (optional luac -p)
+# VALIDATION (luac -p if available)
 # -----------------------------------------------------------------------------
 def _validate(code: str) -> bool:
     try:
@@ -451,28 +422,62 @@ def _validate(code: str) -> bool:
     except: return True
 
 # -----------------------------------------------------------------------------
-# 10. MAIN OBFUSCATOR
+# MAIN OBFUSCATOR
 # -----------------------------------------------------------------------------
 def obfuscate_luau(source: str) -> str:
-    # Step 1: rename locals
+    # 1. Rename locals
     code = _rename_locals(source)
 
-    # Step 2: tokenize
+    # 2. Tokenize
     tokens = Scanner(code).scan()
 
-    # Step 3: build global map (for function calls)
-    global_map = _build_global_map(tokens)
-    lookup_name = _fresh(set(), confuse=False)  # will be used later
+    # 3. Build global map (identifiers not in local scopes)
+    root = _build_scopes(tokens)
+    def is_local(name, sc):
+        if name in sc.names: return True
+        for child in sc.children:
+            if is_local(name, child): return True
+        return False
 
-    # Step 4: process tokens – encrypt strings, mask numbers, collect records
-    used = set()
+    global_map = {}
+    for t in tokens:
+        if t.kind == TokenKind.IDENTIFIER:
+            if not is_local(t.value, root):
+                if t.value not in global_map:
+                    global_map[t.value] = 0
+    # assign indices
+    names = list(global_map.keys())
+    for i, name in enumerate(names):
+        global_map[name] = i + 1  # 1-indexed
+
+    # 4. Replace globals with lookup table (placeholders)
+    lookup_name = _fresh(set(), confuse=False)
+    tokens = _replace_globals(tokens, global_map, lookup_name)
+
+    # 5. Process tokens: encrypt strings, mask numbers, collect records
     records = []
     out_tokens = []
+    # We also need to encrypt the global names for the lookup table
+    # We'll add the global names as strings to the records
+    global_strings = {}
+    for name, idx in global_map.items():
+        # We'll encrypt the name and store it
+        enc = _encrypt_string(name, secrets.randbelow(0xFFFFFFFF))
+        # We'll store the index of the record for each global name
+        global_strings[idx] = len(records)
+        records.append(enc)
+
     for t in tokens:
         if t.kind in (TokenKind.STRING, TokenKind.LONG_STRING):
             enc = _encrypt_string(t.value, secrets.randbelow(0xFFFFFFFF))
             records.append(enc)
             out_tokens.append(f"__R{len(records)-1}__")
+        elif t.kind == TokenKind.IDENTIFIER and t.value.startswith("__G") and t.value.endswith("__"):
+            # This is a global placeholder like __G1__
+            idx = int(t.value[3:-2])
+            # Replace with decode(record_index)
+            rec_idx = global_strings[idx]
+            out_tokens.append(f"{lookup_name}[{rec_idx}]")
         elif t.kind in (TokenKind.NUMBER, TokenKind.HEX_NUMBER):
             try:
                 val = int(t.value, 0)
@@ -483,56 +488,15 @@ def obfuscate_luau(source: str) -> str:
         else:
             out_tokens.append(t.value)
 
-    # Step 5: replace globals with lookup table
-    # We'll need to tokenize out_tokens again? Instead we can use the original tokens
-    # and replace after we have the lookup name.
-    # We'll reconstruct tokens from out_tokens? Simpler: we already have the token list,
-    # we can modify it.
-    # Let's do a pass on the original token list and replace globals.
-    # But we need the lookup_name; we already generated it.
-    # We'll replace in the original tokens before we convert to out_tokens?
-    # We'll re-tokenize the renamed code? Actually we have the renamed code as a string.
-    # Better: after renaming, we tokenize, build global_map, then do replacement on tokens
-    # before processing strings/numbers.
-    # We'll restructure:
-    #   - rename -> code
-    #   - tokenize -> tokens
-    #   - build global_map
-    #   - replace globals in tokens (with lookup_name)
-    #   - then process tokens to encrypt strings, etc.
-    # But the global replacement also replaces function names like 'print' with lookup table.
-    # We need to ensure the lookup table is defined in the runtime.
-
-    # Let's rebuild the tokens after global replacement
-    tokens_replaced = _replace_globals(tokens, global_map, lookup_name)
-
-    # Now process tokens_replaced
-    records = []
-    out_tokens = []
-    for t in tokens_replaced:
-        if t.kind in (TokenKind.STRING, TokenKind.LONG_STRING):
-            enc = _encrypt_string(t.value, secrets.randbelow(0xFFFFFFFF))
-            records.append(enc)
-            out_tokens.append(f"__R{len(records)-1}__")
-        elif t.kind in (TokenKind.NUMBER, TokenKind.HEX_NUMBER):
-            try:
-                val = int(t.value, 0)
-                if abs(val) < 1000000:
-                    out_tokens.append(_mask_int(val))
-                else: out_tokens.append(t.value)
-            except: out_tokens.append(t.value)
-        else:
-            out_tokens.append(t.value)
-
-    # Shuffle records
+    # 6. Shuffle records
     order = list(range(len(records)))
     secrets.SystemRandom().shuffle(order)
     ordered = [records[i] for i in order]
 
-    # Generate runtime (includes lookup table)
-    runtime_code, decode_fn = generate_runtime(ordered, used, global_map)
+    # 7. Generate runtime
+    runtime_code, decode_fn, global_lookup = generate_runtime(ordered, set(), global_map)
 
-    # Replace placeholders in body
+    # 8. Replace placeholders in body tokens
     body_tokens = []
     for tok in out_tokens:
         if tok.startswith("__R") and tok.endswith("__"):
@@ -542,8 +506,8 @@ def obfuscate_luau(source: str) -> str:
             body_tokens.append(tok)
     body = " ".join(body_tokens)
 
-    # Add control-flow flattening (lightweight)
-    state = _fresh(used)
+    # 9. Control-flow flattening (lightweight)
+    state = _fresh(set())
     body_lines = body.splitlines()
     flattened = [f"local {state}=0", "while true do", f"if {state}==0 then"]
     flattened.extend("    " + l for l in body_lines)
@@ -554,33 +518,31 @@ def obfuscate_luau(source: str) -> str:
     flattened.append("end")
     body = "\n".join(flattened)
 
-    # Inject junk (optional)
-    if OBFUSCATION_LEVEL in ("MAX","HIGH"):
+    # 10. Junk code (safe)
+    if OBFUSCATION_LEVEL in ("MAX", "HIGH"):
         junk = []
         if secrets.randbelow(100) < 30:
-            v = _fresh(used); junk.append(f"local {v}={_mask_int(secrets.randbelow(1000))}")
+            v = _fresh(set()); junk.append(f"local {v}={_mask_int(secrets.randbelow(1000))}")
         if secrets.randbelow(100) < 20:
             junk.append("if false then end")
         if junk:
             body = "\n".join(junk) + "\n" + body
 
-    # Assemble final: return({L=function() ... end})()
-    # runtime_code contains the decoder and lookup table; we put it inside the function.
-    # The body is placed after the runtime.
+    # 11. Assemble IIFE: (function() ... end)()
     func_body = runtime_code + "\n" + body
-    final_code = f"return({{L=function(){func_body}end}})()"
+    final = f"(function(){func_body}end)()"
 
-    # Minify to one line
-    final_code = _minify(final_code)
+    # 12. Minify to one line
+    final = _minify(final)
 
-    # Validate
-    if not _validate(final_code):
+    # 13. Validate
+    if not _validate(final):
         raise RuntimeError("Validation failed – generated code invalid")
 
-    return final_code
+    return final
 
 # -----------------------------------------------------------------------------
-# 11. DISCORD COG
+# DISCORD COG
 # -----------------------------------------------------------------------------
 def _output_name(filename: str) -> str:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename).stem).strip("._")
