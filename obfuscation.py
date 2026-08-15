@@ -1,391 +1,285 @@
-from __future__ import annotations
-
-import asyncio
+import discord
+from discord import app_commands
+from discord.ext import commands
 import io
-import re
-import secrets
+import asyncio
 import random
+import base64
+import re
+import os
 import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Set, Dict, Tuple, Optional
 
-import discord
-from discord import app_commands
-from discord.ext import commands
+# --- Dependencies for Luau parsing and AST manipulation ---
+# These will attempt to import the required packages.
+# If they are not installed, the cog will raise an error on load.
+try:
+    from luaparser import ast, astnodes
+    from luaparser.parser import Parser
+except ImportError:
+    raise ImportError("The 'luaparser' library is required. Please install it with: pip install luaparser")
+
 
 # -----------------------------------------------------------------------------
-# CONFIG
+# 1. STRING ENCRYPTER (from Opiens)
+# -----------------------------------------------------------------------------
+class StringEncrypter:
+    def __init__(self, Source, Parser, StrKey):
+        self.Source = Source
+        self.StrKey = StrKey
+        self.Parser = Parser
+        self.B32Decryptor = (
+            'local function a(b,c)local d={}for e=1,#b,c do table.insert(d,b:sub(e,e+c-1))end;return d end;'
+            'local function f(g)local d=""repeat local h=g/2;local i,j=math.modf(h)g=i;d=math.ceil(j)..d until g==0;return d end;'
+            'local k="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"'
+            'local function Base32(b)local m=b:gsub(".",function(n)if n=="="then return""end;local o=string.find(k,n)o=o-1;return string.format("%05u",f(o))end)'
+            'local p=a(m,8)local q={}for r,s in pairs(p)do table.insert(q,string.char(tonumber(s,2)))end;'
+            'local t=table.concat(q)local u={}for e=1,#t,1 do local s=string.byte(t,e)table.insert(u,e,s)end;'
+            'local v=""for e=1,#u-1,1 do local s=u[e]local w=DecryptSTR(s)v=v..string.char(w)end;return v end\n'
+        )
+        self.StrDecryptor = (
+            "local function DecryptSTR(b)local c,d=1,0;local e={};while b>0 and e>0 do local f,g=b%2,e%2;"
+            "if f~=g then d=d+c end;b=(b-f)/2;e=(e-g)/2;c=c*2 end;"
+            "if b<e then b=e end;while b>0 do local f=b%2;if f>0 then d=d+c end;b=(b-f)/2;c=c*2 end; return d end;\n"
+            .format(StrKey) + self.B32Decryptor
+        )
+
+    @staticmethod
+    def RandomString(Len):
+        return ''.join(random.choice('qwertyuioplkjhgfdsazxcvbnmQWERTYUIOPLKJHGFDSAZXCVBNM') for i in range(Len))
+
+    @staticmethod
+    def Encrypt(plaintext, key):
+        PTBytes = [ord(a.encode("utf-8")) for a in plaintext]
+        for a in range(len(PTBytes)):
+            PTBytes[a] = PTBytes[a] ^ key
+        return base64.b32encode(bytes(PTBytes)).decode('utf-8')
+
+    def EncryptStrings(self):
+        LocalCount = 0
+        StringTable = []
+        LocalNameTable = []
+        LocalTable = []
+        StringNodes = self.Parser.GetStrings()
+
+        for mNode in StringNodes:
+            if LocalCount > 100:
+                break
+            try:
+                String = mNode.s
+                LocalCount += 1
+                StringTable.append(String)
+                RString = self.RandomString(7)
+                LocalNameTable.append(RString)
+                LocalTable.append("local " + RString + " = Base32(\"" + StringEncrypter.Encrypt(String, self.StrKey) + "\")\n")
+            except:
+                pass
+
+        for Idx in range(0, len(StringTable)):
+            self.Source = self.Source.replace('"' + StringTable[Idx] + '"', '(' + LocalNameTable[Idx] + ')', 1)
+        for Idx in range(0, len(StringTable)):
+            self.Source = self.Source.replace("'" + StringTable[Idx] + "'", '(' + LocalNameTable[Idx] + ')', 1)
+
+        RetCode = ""
+        for a in LocalTable:
+            RetCode += a + "\n"
+        RetCode += self.Source
+
+        return RetCode, self.StrDecryptor
+
+
+# -----------------------------------------------------------------------------
+# 2. MATH ENCRYPTER (from Opiens)
+# -----------------------------------------------------------------------------
+class MathEncrypter:
+    def __init__(self, Parser, IntKey):
+        self.Left = 0
+        self.Right = 0
+        self.Result = 0
+        self.Decrypt = "local function DecryptINT(b)local c,d=1,0;local e={};while b>0 and e>0 do local f,g=b%2,e%2;if f~=g then d=d+c end;b=(b-f)/2;e=(e-g)/2;c=c*2 end;if b<e then b=e end;while b>0 do local f=b%2;if f>0 then d=d+c end;b=(b-f)/2;c=c*2 end; return d end\n".format(IntKey)
+        self.IntKey = IntKey
+        self.Parser = Parser
+
+    @staticmethod
+    def GetRandomString(Len):
+        Alfabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+        Result = ""
+        for Idx in range(0, Len):
+            Result += random.choice(Alfabet)
+        return Result
+
+    @staticmethod
+    def TurnStringOrNumber(Num):
+        Chc = random.randint(0, 1)
+        if Chc:
+            return "#\"" + MathEncrypter.GetRandomString(Num) + "\""
+        else:
+            return Num
+
+    def EncryptMath(self):
+        self.EncryptNumbers()
+        return self.Parser.GetAstTree(), self.Decrypt
+
+    def EncryptNumbers(self):
+        NumberNode = []
+
+        class NumberVisitor(ast.ASTVisitor):
+            def visit_Number(self, node):
+                if node.n >= 0 and type(node.n) == int:
+                    NumberNode.append(node)
+
+        NumberVisitor().visit(self.Parser.GetAstTree())
+
+        for Idx in range(0, len(NumberNode)):
+            Arguments = [astnodes.Number(NumberNode[Idx].n ^ self.IntKey)]
+            ch = random.randint(0, 2)
+            while not ch:
+                ch = random.randint(0, 2)
+                Arguments.append(astnodes.Number(random.randint(0, 100)))
+
+            self.Parser.ReplaceValues(NumberNode[Idx], astnodes.Call(astnodes.Name("DecryptINT"), Arguments))
+
+
+# -----------------------------------------------------------------------------
+# 3. LOCAL TRANSFORMER (from Opiens)
+# -----------------------------------------------------------------------------
+class Local:
+    def __init__(self, Parser, AstTree):
+        self.Operator = ""
+        self.Parser = Parser
+        self.AstTree = AstTree
+
+    def PutLocalOnTop(self):
+        Locals = self.Parser.GetLocalAssigns()
+        for Idx in range(0, len(Locals)):
+            if Locals[Idx].values != []:
+                TempNode = Locals[Idx]
+                self.Parser.ReplaceNode(TempNode, astnodes.Assign(TempNode.targets, TempNode.values))
+                self.Parser.InsertNode(astnodes.LocalAssign(TempNode.targets, astnodes.Nil()), Idx)
+            elif Locals[Idx].values == []:
+                TempNode = Locals[Idx]
+                self.Parser.ReplaceNode(TempNode, astnodes.LocalAssign(TempNode.targets, astnodes.Nil()))
+
+        FuncLocals = self.Parser.GetLocalFunctions()
+        for Idx in range(0, len(FuncLocals)):
+            if FuncLocals[Idx].name != []:
+                TempNode = FuncLocals[Idx]
+                self.Parser.ReplaceNode(TempNode, astnodes.Assign(TempNode.name.id, astnodes.AnonymousFunction(TempNode.args, TempNode.body)))
+                self.Parser.InsertNode(astnodes.LocalAssign(TempNode.name.id, astnodes.Nil()), Idx)
+
+        return self.Parser.GetAstTree()
+
+
+# -----------------------------------------------------------------------------
+# 4. MAIN OBFUSCATOR (from Opiens, adapted)
+# -----------------------------------------------------------------------------
+class Obfuscator:
+    def __init__(self, Source, Options):
+        self.Parser = Parser(Source)
+        self.Options = Options
+        self.AstTree = self.Parser.Parse()
+        self.Source = Source
+        self.IntKey = random.randint(10, 50)
+        self.StrKey = random.randint(10, 50)
+        self.IntDecryptor = ""
+        self.StrDecryptor = ""
+
+    def Obfuscate(self):
+        self.AstTree = Local(self.Parser, self.AstTree).PutLocalOnTop()
+        self.Parser.AstTree = self.AstTree
+
+        if self.Options["Encryption"]["Integer"]:
+            self.AstTree, self.IntDecryptor = MathEncrypter(self.Parser, self.IntKey).EncryptMath()
+            self.Source = ast.to_lua_source(self.AstTree)
+
+        if self.Options["Encryption"]["String"]:
+            self.Source, self.StrDecryptor = StringEncrypter(self.Source, self.Parser, self.StrKey).EncryptStrings()
+            self.Parser = Parser(self.Source)
+            self.AstTree = self.Parser.Parse()
+
+        self.Source = self.IntDecryptor + self.StrDecryptor + self.Source
+
+        # If VM obfuscation is enabled, this would compile to bytecode and embed it.
+        # For this standalone version, we'll skip the VM part as it requires additional
+        # files from the original repo (Vm/BytecodeRW, Vm/Bytecode/Compiler, Rewriter/Flattener).
+        if self.Options.get("Vm", False):
+            # Placeholder for VM obfuscation logic
+            pass
+
+        return self.Source
+
+
+# -----------------------------------------------------------------------------
+# 5. DISCORD COG
 # -----------------------------------------------------------------------------
 MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate v18"
-OBFUSCATION_LEVEL = "MAX"
 
-# -----------------------------------------------------------------------------
-# SHORT IDENTIFIERS
-# -----------------------------------------------------------------------------
-_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
-def _fresh_short(used: set[str]) -> str:
-    for c in _CHARS:
-        if c not in used:
-            used.add(c); return c
-    for c1 in _CHARS:
-        for c2 in _CHARS:
-            n = c1 + c2
-            if n not in used:
-                used.add(n); return n
-    return "x"
-
-def _fresh(used: set[str], *, confuse=False) -> str:
-    return _fresh_short(used)
-
-def _sep(a: str, b: str) -> bool:
-    if not a or not b: return False
-    if (a[-1].isalnum() or a[-1] == "_") and (b[0].isalnum() or b[0] == "_"):
-        return True
-    return a.endswith("-") and b.startswith("-")
-
-def _compact(tokens: list[str]) -> str:
-    out = []
-    for t in tokens:
-        if out and _sep(out[-1], t):
-            out.append(" ")
-        out.append(t)
-    return "".join(out)
-
-# -----------------------------------------------------------------------------
-# TOKENIZER (for minification only)
-# -----------------------------------------------------------------------------
-class TokenKind:
-    WHITESPACE = "whitespace"; COMMENT = "comment"; LONG_COMMENT = "long_comment"
-    STRING = "string"; LONG_STRING = "long_string"; NUMBER = "number"
-    HEX_NUMBER = "hex_number"; IDENTIFIER = "identifier"; KEYWORD = "keyword"
-    SYMBOL = "symbol"; EOF = "eof"
-
-class Token:
-    __slots__ = ("kind", "value", "line", "col")
-    def __init__(self, kind, value, line=0, col=0):
-        self.kind = kind; self.value = value; self.line = line; self.col = col
-
-class Scanner:
-    def __init__(self, source: str):
-        self.source = source; self.length = len(source); self.pos = 0
-        self.line = 1; self.col = 1; self.tokens = []
-    def scan(self) -> List[Token]:
-        while self.pos < self.length:
-            ch = self.source[self.pos]
-            if ch in " \t\r\n": self._scan_whitespace()
-            elif ch == '-' and self.pos + 1 < self.length and self.source[self.pos+1] == '-': self._scan_comment()
-            elif ch in "\"'": self._scan_string(ch)
-            elif ch == '[' and self.pos + 1 < self.length and self.source[self.pos+1] in "[":
-                self._scan_long_string()
-            elif ch.isdigit() or (ch == '.' and self.pos+1 < self.length and self.source[self.pos+1].isdigit()):
-                self._scan_number()
-            elif ch.isalpha() or ch == '_': self._scan_identifier_or_keyword()
-            else: self._scan_symbol()
-        self.tokens.append(Token(TokenKind.EOF, "", self.line, self.col))
-        return self.tokens
-    def _scan_whitespace(self):
-        start = self.pos
-        while self.pos < self.length and self.source[self.pos] in " \t\r\n":
-            if self.source[self.pos] == '\n': self.line += 1; self.col = 1
-            else: self.col += 1
-            self.pos += 1
-        self.tokens.append(Token(TokenKind.WHITESPACE, self.source[start:self.pos], self.line, self.col))
-    def _scan_comment(self):
-        start = self.pos
-        if self.pos + 2 < self.length and self.source[self.pos+2] == '[':
-            self.pos += 2; self.col += 2; eq = 0
-            while self.pos < self.length and self.source[self.pos] == '=': eq += 1; self.pos += 1; self.col += 1
-            if self.pos < self.length and self.source[self.pos] == '[':
-                self.pos += 1; self.col += 1; close = ']' + '=' * eq + ']'
-                end = self.source.find(close, self.pos)
-                if end != -1:
-                    end += len(close)
-                    self.tokens.append(Token(TokenKind.LONG_COMMENT, self.source[start:end], self.line, self.col))
-                    self.pos = end; self.col = 1; return
-        self.pos += 2; self.col += 2
-        while self.pos < self.length and self.source[self.pos] != '\n': self.pos += 1; self.col += 1
-        self.tokens.append(Token(TokenKind.COMMENT, self.source[start:self.pos], self.line, self.col))
-    def _scan_string(self, quote):
-        start = self.pos; self.pos += 1; self.col += 1
-        while self.pos < self.length:
-            ch = self.source[self.pos]
-            if ch == '\\': self.pos += 2; self.col += 2
-            elif ch == quote: self.pos += 1; self.col += 1; self.tokens.append(Token(TokenKind.STRING, self.source[start:self.pos], self.line, self.col)); return
-            elif ch == '\n': self.line += 1; self.col = 1; self.pos += 1
-            else: self.pos += 1; self.col += 1
-        self.tokens.append(Token(TokenKind.STRING, self.source[start:self.pos], self.line, self.col))
-    def _scan_long_string(self):
-        start = self.pos; self.pos += 2; self.col += 2; eq = 0
-        while self.pos < self.length and self.source[self.pos] == '=': eq += 1; self.pos += 1; self.col += 1
-        if self.pos < self.length and self.source[self.pos] == '[':
-            self.pos += 1; self.col += 1; close = ']' + '=' * eq + ']'
-            end = self.source.find(close, self.pos)
-            if end != -1:
-                end += len(close)
-                self.tokens.append(Token(TokenKind.LONG_STRING, self.source[start:end], self.line, self.col))
-                self.pos = end; self.col = 1; return
-        self.tokens.append(Token(TokenKind.STRING, self.source[start:self.pos], self.line, self.col))
-    def _scan_number(self):
-        start = self.pos
-        if self.source[self.pos] == '0' and self.pos+1 < self.length and self.source[self.pos+1].lower() == 'x':
-            self.pos += 2
-            while self.pos < self.length and self.source[self.pos].isalnum(): self.pos += 1
-            self.tokens.append(Token(TokenKind.HEX_NUMBER, self.source[start:self.pos], self.line, self.col)); return
-        while self.pos < self.length and (self.source[self.pos].isdigit() or self.source[self.pos] == '.'): self.pos += 1
-        if self.pos < self.length and self.source[self.pos] in 'eE':
-            self.pos += 1
-            if self.pos < self.length and self.source[self.pos] in '+-': self.pos += 1
-            while self.pos < self.length and self.source[self.pos].isdigit(): self.pos += 1
-        self.tokens.append(Token(TokenKind.NUMBER, self.source[start:self.pos], self.line, self.col))
-    def _scan_identifier_or_keyword(self):
-        start = self.pos
-        while self.pos < self.length and (self.source[self.pos].isalnum() or self.source[self.pos] == '_'): self.pos += 1
-        ident = self.source[start:self.pos]
-        keywords = {"and","break","do","else","elseif","end","false","for","function","goto",
-                    "if","in","local","nil","not","or","repeat","return","then","true","until","while"}
-        kind = TokenKind.KEYWORD if ident in keywords else TokenKind.IDENTIFIER
-        self.tokens.append(Token(kind, ident, self.line, self.col))
-    def _scan_symbol(self):
-        start = self.pos; self.pos += 1; self.col += 1
-        self.tokens.append(Token(TokenKind.SYMBOL, self.source[start:self.pos], self.line, self.col))
-
-# -----------------------------------------------------------------------------
-# LITERAL BYTES (for encryption)
-# -----------------------------------------------------------------------------
-def _literal_bytes(val: str) -> list[int] | None:
-    if val.startswith("["):
-        m = re.match(r"^\[(=*)\[(.*)\]\1\]$", val, re.DOTALL)
-        return list(m.group(2).encode()) if m else None
-    if len(val) < 2 or val[0] not in {'"', "'"} or val[-1] != val[0]: return None
-    body = val[1:-1]; result = []; i = 0
-    esc = {"a":7,"b":8,"f":12,"n":10,"r":13,"t":9,"v":11,"\\":92,"'":39,'"':34}
-    while i < len(body):
-        ch = body[i]
-        if ch != "\\": result.extend(ch.encode()); i += 1; continue
-        i += 1
-        if i >= len(body): return None
-        e = body[i]
-        if e in esc: result.append(esc[e]); i += 1; continue
-        if e == "x" and i + 2 < len(body):
-            d = body[i+1:i+3]
-            if re.fullmatch(r"[0-9a-fA-F]{2}", d):
-                result.append(int(d, 16)); i += 3; continue
-        if e.isdigit():
-            d = e; c = i + 1
-            while c < len(body) and len(d) < 3 and body[c].isdigit():
-                d += body[c]; c += 1
-            n = int(d)
-            if n > 255: return None
-            result.append(n); i = c; continue
-        if e in {"\n", "\r"}:
-            if e == "\r" and i + 1 < len(body) and body[i+1] == "\n": i += 1
-            result.append(10); i += 1; continue
-        return None
-    return result
-
-# -----------------------------------------------------------------------------
-# INTEGER OBFUSCATION (hex + MBA)
-# -----------------------------------------------------------------------------
-def _mask_int(n: int) -> str:
-    if n < 0: return "(-" + _mask_int(-n) + ")"
-    if n in (0, 1): return hex(n)
-    r = secrets.randbelow(5)
-    if r == 0:
-        k = secrets.randbelow(100) + 1
-        return f"({hex(n+k)}-{hex(k)})"
-    elif r == 1:
-        k = secrets.randbelow(50) + 2
-        return f"(({hex(n*k)})//{hex(k)})"
-    elif r == 2:
-        k = secrets.randbelow(0xFFFF) + 1
-        return f"({hex(n^k)}~{hex(k)})"
-    elif r == 3:
-        k = secrets.randbelow(0xFF) + 1
-        return f"(({hex(n)}&{hex(k)})|({hex(n|k)}~{hex(k^(n&k))}))"
-    else:
-        a = secrets.randbelow(0xFFF) + 1
-        return f"({hex(n^a)}~{hex(a)})"
-
-# -----------------------------------------------------------------------------
-# STRING ENCRYPTION (stores metadata as a table)
-# -----------------------------------------------------------------------------
-def _encrypt_string(plain: str, seed: int) -> dict:
-    bytes_ = _literal_bytes(plain)
-    if bytes_ is None:
-        raise ValueError(f"Invalid string literal: {plain}")
-    n = len(bytes_)
-    if n == 0: return {"chunks": [[]], "meta": [0,0,0,0,0,0,0], "chk": 2166136261, "len": 0}
-    rng = random.Random(seed)
-    split = rng.randint(2, 5)
-    seed_val = rng.randint(1, 251); add = rng.randint(0, 250); step = rng.randint(1, 31)
-    blk = rng.randint(1, 251); rot = rng.randint(1, 7); rev = rng.randint(0, 1)
-    s1 = [b ^ ((seed_val + i * step + add) % 256) for i, b in enumerate(bytes_)]
-    s2 = [((b << rot) | (b >> (8 - rot))) & 0xFF for b in s1]
-    s3 = [b ^ blk for b in s2]
-    if rev: s3 = s3[::-1]
-    chunks = [[] for _ in range(split)]
-    for i, b in enumerate(s3): chunks[i % split].append(b)
-    chk = 2166136261
-    for b in bytes_: chk = ((chk ^ b) * 16777619) & 0xFFFFFFFF
-    meta = [split, seed_val, add, step, blk, rot, rev]
-    return {"chunks": chunks, "meta": meta, "chk": chk, "len": n}
-
-# -----------------------------------------------------------------------------
-# DECODER RUNTIME (native bitwise ops, metadata as table)
-# -----------------------------------------------------------------------------
-def generate_runtime(record: dict, used: set) -> str:
-    N = lambda: _fresh(used, confuse=False)
-    xor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
-    char, concat, floor = N(), N(), N()
-    trap, meta_tbl, chunk_tbl, len_tbl, chk_tbl, cache, decode_fn = N(), N(), N(), N(), N(), N(), N()
-
-    # meta is a table of 7 numbers
-    meta = "{" + ",".join(str(hex(x)) for x in record["meta"]) + "}"
-    chunk_strs = ["{" + ",".join(hex(b) for b in ch) + "}" for ch in record["chunks"]]
-    chunks = "{" + ",".join(chunk_strs) + "}"
-    lens = str(hex(record["len"]))
-    chks = str(hex(record["chk"]))
-
-    runtime = f"""local {xor},{bor},{band},{lshift},{rshift}=function(a,b)return a~b end,function(a,b)return a|b end,function(a,b)return a&b end,function(a,b)return a<<b end,function(a,b)return a>>b end
-local {char},{concat},{floor}=string.char,table.concat,math.floor
-local {trap}=function()error("",0)end
-local {meta_tbl}={meta}
-local {chunk_tbl}={chunks}
-local {len_tbl}={lens}
-local {chk_tbl}={chks}
-local {cache}={{}}
-local function {decode_fn}(idx)
-if {cache}[idx] then return {cache}[idx] end
-local m={meta_tbl}
-local n={len_tbl}
-local expected={chk_tbl}
-local split=m[1]
-local seed=m[2]
-local add=m[3]
-local step=m[4]
-local blk=m[5]
-local rot=m[6]
-local rev=m[7]
-local chunks={chunk_tbl}
-local out={{}}; local chk=0x81F
-for i=1,n do
-local ci=(i-1)%split+1
-local chunk=chunks[ci]
-if not chunk then {trap}() end
-local bi=(i-1)//split+1
-local b=chunk[bi]
-if not b then {trap}() end
-local v=b
-v={xor}(v,blk)
-v={bor}({rshift}(v,rot),{lshift}(v,0x8-rot))
-v={band}(v,0xFF)
-v={xor}(v,(seed+(i-1)*step+add)%0x100)
-if v<0 then v=v+0x100 end
-chk={band}(({xor}(chk,v)*0x1000193),0xFFFFFFFF)
-local pos=i
-if rev==1 then pos=n-i+1 end
-out[pos]={char}(v)
-end
-if chk~=expected then {trap}() end
-local result={concat}(out)
-{cache}[idx]=result
-return result
-end
-local payload={decode_fn}(0)
-local fn, err=loadstring(payload)
-if not fn then error(err,0) end
-fn()"""
-    return runtime
-
-# -----------------------------------------------------------------------------
-# MINIFICATION (one line)
-# -----------------------------------------------------------------------------
-def _minify(code: str) -> str:
-    tokens = Scanner(code).scan()
-    filtered = [t for t in tokens if t.kind not in (TokenKind.COMMENT, TokenKind.LONG_COMMENT, TokenKind.WHITESPACE)]
-    return _compact([t.value for t in filtered])
-
-# -----------------------------------------------------------------------------
-# VALIDATION (luac -p if available)
-# -----------------------------------------------------------------------------
-def _validate(code: str) -> bool:
-    try:
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.lua', delete=False) as f:
-            f.write(code); f.flush()
-            result = subprocess.run(["luac", "-p", f.name], capture_output=True, text=True)
-            return result.returncode == 0
-    except: return True
-
-# -----------------------------------------------------------------------------
-# MAIN OBFUSCATOR
-# -----------------------------------------------------------------------------
-def obfuscate_luau(source: str) -> str:
-    # 1. Escape source for double-quoted string
-    escaped = source.replace('\\', '\\\\').replace('"', '\\"')
-    source_literal = '"' + escaped + '"'
-
-    # 2. Encrypt the whole source as a single string
-    seed = secrets.randbelow(0xFFFFFFFF)
-    encrypted = _encrypt_string(source_literal, seed)
-
-    # 3. Generate runtime that decodes and executes
-    used = set()
-    runtime = generate_runtime(encrypted, used)
-
-    # 4. Wrap in IIFE and minify
-    final = "(function()%s end)()" % runtime
-    final = _minify(final)
-
-    # 5. Validate
-    if not _validate(final):
-        raise RuntimeError("Validation failed – generated code invalid")
-
-    return final
-
-# -----------------------------------------------------------------------------
-# DISCORD COG
-# -----------------------------------------------------------------------------
 def _output_name(filename: str) -> str:
     stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", Path(filename).stem).strip("._")
-    return f"{stem or 'script'}.obfuscated.txt"
+    return f"{stem or 'script'}.obfuscated.lua"
 
-class Obfuscation(commands.Cog):
+class ObfuscationCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="obf", description="Obfuscate a Luau .TXT file")
-    @app_commands.describe(file="Attach the .TXT Luau source file to obfuscate")
-    async def obf(self, interaction: discord.Interaction, file: discord.Attachment | None = None):
-        if file is None:
-            await interaction.response.send_message("Attach a `.TXT` file to continue.", ephemeral=True)
+    @app_commands.command(name="obfuscate", description="Obfuscate a Luau source file using the Opiens Obfuscator.")
+    @app_commands.describe(file="Attach the .lua or .txt Luau source file to obfuscate")
+    async def obfuscate(self, interaction: discord.Interaction, file: discord.Attachment):
+        if not file.filename.lower().endswith((".lua", ".txt")):
+            await interaction.response.send_message("Please upload a `.lua` or `.txt` file.", ephemeral=True)
             return
-        if not file.filename.lower().endswith(".txt"):
-            await interaction.response.send_message("Only `.TXT` files are supported.", ephemeral=True)
-            return
-        if file.size and file.size > MAX_SOURCE_BYTES:
-            await interaction.response.send_message(f"Too large. Limit is {MAX_SOURCE_BYTES // 1000} KB.", ephemeral=True)
-            return
-        await interaction.response.defer(thinking=True)
-        try:
-            src = await file.read()
-            if len(src) > MAX_SOURCE_BYTES:
-                raise ValueError("Too large.")
-            source = src.decode("utf-8-sig")
-            if not source.strip():
-                raise ValueError("Empty file.")
-            obf = await asyncio.to_thread(obfuscate_luau, source)
-            out = discord.File(io.BytesIO(obf.encode()), filename=_output_name(file.filename))
-            await interaction.followup.send(content="- obfuscated by buterfuscate", file=out, allowed_mentions=discord.AllowedMentions.none())
-        except UnicodeDecodeError:
-            await interaction.followup.send("Could not read as UTF-8.", ephemeral=True)
-        except ValueError as e:
-            await interaction.followup.send(str(e), ephemeral=True)
-        except Exception as e:
-            print(f"Obfuscation error: {e}")
-            await interaction.followup.send("Obfuscation failed. Check the file and try again.", ephemeral=True)
 
+        if file.size > MAX_SOURCE_BYTES:
+            await interaction.response.send_message(f"File too large. Max size is {MAX_SOURCE_BYTES // 1024} KB.", ephemeral=True)
+            return
+
+        await interaction.response.defer(thinking=True)
+
+        try:
+            raw_source = await file.read()
+            source = raw_source.decode("utf-8-sig")
+
+            if not source.strip():
+                await interaction.followup.send("The file is empty.", ephemeral=True)
+                return
+
+            # Define obfuscation options
+            options = {
+                "Encryption": {
+                    "Integer": True,
+                    "String": True
+                },
+                "Vm": False  # VM obfuscation is disabled in this standalone version
+            }
+
+            # Run obfuscation in a thread to avoid blocking the event loop
+            obfuscated = await asyncio.to_thread(self._run_obfuscator, source, options)
+
+            # Send the result
+            out_file = discord.File(
+                io.BytesIO(obfuscated.encode("utf-8")),
+                filename=_output_name(file.filename)
+            )
+            await interaction.followup.send(
+                content="✅ Obfuscation complete!",
+                file=out_file
+            )
+
+        except UnicodeDecodeError:
+            await interaction.followup.send("Could not read the file as UTF-8. Please ensure it's a text file.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"An error occurred during obfuscation: {str(e)}", ephemeral=True)
+
+    def _run_obfuscator(self, source: str, options: dict) -> str:
+        """Wrapper to run the obfuscator in a separate thread."""
+        obf = Obfuscator(source, options)
+        return obf.Obfuscate()
+
+
+# -----------------------------------------------------------------------------
+# 6. SETUP FUNCTION FOR THE COG
+# -----------------------------------------------------------------------------
 async def setup(bot: commands.Bot):
-    await bot.add_cog(Obfuscation(bot))
+    await bot.add_cog(ObfuscationCog(bot))
