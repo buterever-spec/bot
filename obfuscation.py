@@ -13,10 +13,8 @@ import time
 import os
 import subprocess
 import tempfile
-import struct
-import zlib
 from pathlib import Path
-from typing import List, Dict, Set, Tuple, Optional, Any, Callable
+from typing import List, Dict, Set, Tuple, Optional
 
 import discord
 from discord import app_commands
@@ -63,7 +61,7 @@ def minify_lua(code: str) -> str:
 # -----------------------------------------------------------------------------
 
 class CryptoParams:
-    def __init__(self):
+    def __init__(self, payload_len: int):
         self.seed = random.randint(1, 2**31 - 1)
         self.rounds = random.randint(5, 12)
         self.xor_keys = [random.randint(1, 255) for _ in range(self.rounds)]
@@ -71,7 +69,8 @@ class CryptoParams:
         self.rot_r = [random.randint(1, 7) for _ in range(self.rounds)]
         self.add_const = [random.randint(1, 220) for _ in range(self.rounds)]
         self.pos_mul = random.choice([11, 13, 17, 19, 23, 29, 31, 37])
-        self.perm = random.sample(range(256), 256)  # permutation table
+        # Permutation of length = payload_len
+        self.perm = random.sample(range(payload_len), payload_len) if payload_len > 0 else []
         self.stream_a = random.randint(1000, 99999)
         self.stream_b = random.randint(1000, 99999)
         self.integrity_seed = random.randint(1, 0xFFFFFFFF)
@@ -92,40 +91,36 @@ class CryptoParams:
         }
 
 # -----------------------------------------------------------------------------
-# 3. ENCODER (Python) – applies transforms in forward order
+# 3. ENCODER (Python)
 # -----------------------------------------------------------------------------
 
 class Encoder:
     @staticmethod
     def apply_round(data: bytearray, params: CryptoParams, r: int) -> bytearray:
-        # 1. XOR with per-round key
         k = params.xor_keys[r]
-        for i in range(len(data)):
-            data[i] ^= k
-        # 2. Addition modulo 256 with per-round constant and position factor
         add = params.add_const[r]
         fac = (r + 1) % 7 + 1
-        for i in range(len(data)):
-            data[i] = (data[i] + add + i * fac) & 0xFF
-        # 3. Rotate left
         rot = params.rot_l[r]
-        for i in range(len(data)):
-            data[i] = ((data[i] << rot) | (data[i] >> (8 - rot))) & 0xFF
-        # 4. Position-dependent XOR mixing
+        rot_r = params.rot_r[r]
         pm = params.pos_mul
         seed = params.seed
+
+        for i in range(len(data)):
+            data[i] ^= k
+        for i in range(len(data)):
+            data[i] = (data[i] + add + i * fac) & 0xFF
+        for i in range(len(data)):
+            data[i] = ((data[i] << rot) | (data[i] >> (8 - rot))) & 0xFF
         for i in range(len(data)):
             data[i] ^= (i * pm + (seed & 0xFF) + r * 13) & 0xFF
-        # 5. Rotate right (inverse of a later left rotation)
-        rot_r = params.rot_r[r]
         for i in range(len(data)):
             data[i] = ((data[i] >> rot_r) | (data[i] << (8 - rot_r))) & 0xFF
         return data
 
     @staticmethod
     def apply_permutation(data: bytearray, perm: List[int]) -> bytearray:
-        # Permutation: new[i] = data[perm[i]]
-        return bytearray(data[perm[i]] for i in range(len(data)))
+        # perm is a list of indices of length len(data)
+        return bytearray(data[p] for p in perm)
 
     @staticmethod
     def apply_stream(data: bytearray, params: CryptoParams) -> bytearray:
@@ -140,18 +135,17 @@ class Encoder:
     def encode(payload: bytes, params: CryptoParams) -> bytes:
         data = bytearray(payload)
         # Stage 1: Permutation
-        data = Encoder.apply_permutation(data, params.perm)
-        # Stage 2: Multiple rounds
+        if params.perm:
+            data = Encoder.apply_permutation(data, params.perm)
+        # Stage 2: Rounds
         for r in range(params.rounds):
             data = Encoder.apply_round(data, params, r)
         # Stage 3: Streaming XOR
         data = Encoder.apply_stream(data, params)
-        # Stage 4: Integrity checksum (FNV-1a on original payload)
-        # We'll compute and store separately in metadata; the decoder will compute and compare.
         return bytes(data)
 
 # -----------------------------------------------------------------------------
-# 4. DECODER GENERATOR (Lua) – produces inverse of each stage
+# 4. DECODER GENERATOR (Lua)
 # -----------------------------------------------------------------------------
 
 class DecoderGenerator:
@@ -174,8 +168,7 @@ class DecoderGenerator:
         data_str = "{" + ",".join(map(str, encrypted)) + "}"
         data_tbl_def = f"local {data_tbl}={{{data_str}}}"
 
-        # Metadata: {seed, rounds, xor_keys, rot_l, rot_r, add_const, pos_mul, perm, stream_a, stream_b, integrity_seed}
-        # We'll store as a flat table with arrays for the per-round values
+        # Metadata
         xor_str = "{" + ",".join(map(str, params.xor_keys)) + "}"
         rot_l_str = "{" + ",".join(map(str, params.rot_l)) + "}"
         rot_r_str = "{" + ",".join(map(str, params.rot_r)) + "}"
@@ -196,74 +189,8 @@ class DecoderGenerator:
         ]) + "}"
         meta_str = "{" + meta_entry + "}"
 
-        # We'll generate helper functions for each stage, using local aliases.
-        # The decoder will:
-        # 1. Reverse stream
-        # 2. Reverse rounds (backwards)
-        # 3. Reverse permutation
-        # 4. Compute integrity (FNV-1a on the decoded payload) and compare.
-
-        # Lua code for the FNV-1a hash (32-bit)
-        fnv = f"""
-local function fnv1a(s)
-    local h = 0x811C9DC5
-    for i = 1, #s do
-        h = (h ~ (s[i] or 0)) * 0x01000193
-        h = h & 0xFFFFFFFF
-    end
-    return h
-end
-"""
-
-        # Reverse stream
-        rev_stream = f"""
-local function rev_stream(data, seed, stream_a, stream_b)
-    local state = (seed ~ stream_a) & 0xFFFFFFFF
-    for i = 1, #data do
-        state = (state * 214013 + 2531011) & 0xFFFFFFFF
-        data[i] = data[i] ~ ((state >> 16) & 0xFF)
-        data[i] = data[i] ~ ((i - 1) * stream_b + (seed & 0xFF)) & 0xFF
-    end
-    return data
-end
-"""
-
-        # Reverse permutation
-        # We need the inverse permutation: inv_perm[perm[i]] = i
-        inv_perm = [0] * 256
-        for i, p in enumerate(params.perm):
-            inv_perm[p] = i
-        inv_perm_str = "{" + ",".join(map(str, inv_perm)) + "}"
-        rev_perm = f"""
-local function rev_perm(data, perm)
-    local out = {{}}
-    for i = 1, #data do
-        out[i] = data[perm[i]]
-    end
-    return out
-end
-"""
-
-        # Reverse a single round (inverse operations in reverse order)
-        rev_round = f"""
-local function rev_round(data, seed, pos_mul, r, xor_key, rot_l, rot_r, add_const)
-    -- Inverse of the forward round:
-    -- forward: xor, add, rot_l, pos_mix, rot_r
-    -- inverse: rot_r_inv (same as rotate right, but we already have the value after rot_r)
-    -- we need to undo rot_r (which was applied after pos_mix)
-    -- Actually forward order: xor, add, rot_l, pos_mix, rot_r
-    -- So reverse order: rot_r_inv, pos_mix undo, rot_l_inv, add undo, xor undo
-    -- Since rot_r is right shift in forward, left shift is inverse (or just rotate left by rot_r)
-    -- We'll use the same rot_r but shift left instead.
-    -- We'll create inline for each round to avoid function call overhead.
-end
-"""
-        # Instead of generating separate functions for each round, we'll inline the loop in the main decode function.
-
-        # We'll build the main decode function that applies the stages in reverse order.
-        # We'll use the metadata to retrieve the parameters and apply them.
-
-        decode_code = f"""
+        # Decoder function
+        decoder = f"""
 local function {dec}(idx)
     local m = {meta_tbl}[idx+1]
     local seed, rounds, xor_keys, rot_l, rot_r, add_const, pos_mul, perm, stream_a, stream_b, integrity_seed =
@@ -280,43 +207,40 @@ local function {dec}(idx)
         t[i] = t[i] ~ ((i - 1) * stream_b + (seed & 0xFF)) & 0xFF
     end
 
-    -- Reverse rounds (from rounds down to 1)
+    -- Reverse rounds
     for r = rounds, 1, -1 do
         local k = xor_keys[r]
         local rot_lr = rot_l[r]
         local rot_rr = rot_r[r]
         local addc = add_const[r]
         local fac = (r % 7) + 1
-        -- Reverse rot_r (rotate left by rot_r)
+        -- Inverse of rot_r (rotate left)
         for i = 1, #t do
             t[i] = ((t[i] << rot_rr) | (t[i] >> (8 - rot_rr))) & 0xFF
         end
-        -- Reverse pos_mix (XOR again since it's self-inverse)
+        -- Inverse of position XOR (self-inverse)
         for i = 1, #t do
             t[i] = t[i] ~ ((i - 1) * pos_mul + (seed & 0xFF) + (r - 1) * 13) & 0xFF
         end
-        -- Reverse rot_l (rotate right)
+        -- Inverse of rot_l (rotate right)
         for i = 1, #t do
             t[i] = ((t[i] >> rot_lr) | (t[i] << (8 - rot_lr))) & 0xFF
         end
-        -- Reverse add
+        -- Inverse of add
         for i = 1, #t do
             t[i] = (t[i] - addc - ((i - 1) * fac)) & 0xFF
         end
-        -- Reverse XOR
+        -- Inverse of XOR
         for i = 1, #t do
             t[i] = t[i] ~ k
         end
     end
 
-    -- Reverse permutation (using inverse permutation)
-    -- We'll use the perm table but index inversely: t[i] = src[perm[i]]? Actually forward: new[i] = data[perm[i]]
-    -- Reverse: data[i] = new[inv_perm[i]] where inv_perm[perm[i]] = i
-    -- We'll use a precomputed inverse perm stored in metadata? We'll compute on the fly.
-    -- Since the perm table is stored in metadata, we'll just compute inverse on the fly.
+    -- Reverse permutation: compute inverse permutation
+    -- perm is a list of indices, we need inv[perm[i]] = i
     local inv = {{}}
-    for i = 1, 256 do
-        inv[perm[i]+1] = i
+    for i = 1, #perm do
+        inv[perm[i] + 1] = i  -- Lua tables are 1-indexed
     end
     local out = {{}}
     for i = 1, #t do
@@ -341,12 +265,10 @@ local function {dec}(idx)
     return table.concat(s)
 end
 """
-
-        # We'll also need the main loader that calls decode(0) and loadstring.
-        return decode_code, dec
+        return decoder, dec
 
 # -----------------------------------------------------------------------------
-# 5. MAIN OBFUSCATOR PIPELINE
+# 5. MAIN OBFUSCATOR
 # -----------------------------------------------------------------------------
 
 class Obfuscator:
@@ -359,7 +281,6 @@ class Obfuscator:
         return random_name(self.used, length)
 
     def _validate(self, code: str) -> bool:
-        # Basic structural checks
         if not code.strip():
             return False
         if 'loadstring' not in code or 'function' not in code:
@@ -369,24 +290,22 @@ class Obfuscator:
         return True
 
     def obfuscate(self, source: str) -> str:
-        # 1. Minify source
+        # 1. Minify
         minified = minify_lua(source)
         if not minified.strip():
             return HEADER + "\n" + minified
 
-        # 2. Generate random parameters
-        params = CryptoParams()
+        # 2. Generate parameters based on payload length
+        payload = minified.encode('utf-8')
+        params = CryptoParams(len(payload))
 
-        # 3. Encode payload
-        payload_bytes = minified.encode('utf-8')
-        encrypted = Encoder.encode(payload_bytes, params)
+        # 3. Encode
+        encrypted = Encoder.encode(payload, params)
 
         # 4. Generate Lua decoder
         decoder_code, dec_name = DecoderGenerator.generate(params, encrypted)
 
-        # 5. Build final script: decoder + loader
-        # We'll also include a table layer for extra confusion, but keep it minimal.
-        # The decoder already contains all logic, so we just need to call it.
+        # 5. Build final script
         loader = f"""
 local _payload = {dec_name}(0)
 if not _payload then error("Corrupted payload", 0) end
@@ -394,23 +313,24 @@ local _fn, _err = loadstring(_payload)
 if not _fn then error(_err, 0) end
 _fn()
 """
-        final = f"""
+        # Add a small table layer for extra confusion but keep it minimal
+        # We'll define some dummy locals that are unused (but not too many)
+        dummy = []
+        for _ in range(random.randint(1, 3)):
+            v = self.rn()
+            dummy.append(f"local {v}={random.randint(1,100)}")
+        dummy_code = "\n".join(dummy)
+
+        full = f"""
 {decoder_code}
+{dummy_code}
 {loader}
 """
         # Wrap in IIFE and minify
-        final = f"(function(){final} end)()"
+        final = f"(function(){full} end)()"
         final = re.sub(r'\s+', ' ', final).strip()
 
-        # 6. Validate round-trip (optional, but we'll trust the encoder)
-        # We'll do a quick decode in Python to verify
-        try:
-            # Decrypt using our Python decoder (we'll implement a simple inverse)
-            # For integrity, we'll just check that the Lua code is plausible.
-            pass
-        except Exception as e:
-            raise RuntimeError(f"Round-trip validation failed: {e}")
-
+        # Validate
         if not self._validate(final):
             raise RuntimeError("Obfuscation produced invalid Lua syntax")
 
