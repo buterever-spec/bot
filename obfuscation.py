@@ -11,7 +11,6 @@ import random
 import string
 import time
 import os
-import zlib
 from pathlib import Path
 from typing import List, Dict, Set, Tuple
 
@@ -59,14 +58,12 @@ class PirateObfuscator:
 
     def minify(self, code: str) -> str:
         # Remove comments and extra whitespace
-        # Simple regex-based removal (not full tokenizer, but enough)
         code = re.sub(r'--\[\[.*?\]\]|--[^\n]*', '', code, flags=re.DOTALL)
         code = re.sub(r'\s+', ' ', code).strip()
         return code
 
     def encrypt_payload(self, data: bytes) -> Tuple[List[int], Dict]:
         """Encrypt bytes with multiple passes, return encrypted bytes and metadata."""
-        # Convert to list of ints
         payload = list(data)
         n = len(payload)
         mode = random.randint(0, 3)
@@ -82,7 +79,6 @@ class PirateObfuscator:
         stream_b = random.randint(1000, 99999)
         rotate = random.randint(0, 28)
 
-        # Apply encryption passes (mirroring the example)
         for li in range(NKEYS):
             k, r, ad = keys[li], rots[li], adds[li]
             fac = (li + 1) % 7 + 1
@@ -100,14 +96,12 @@ class PirateObfuscator:
             for i in range(len(payload)):
                 payload[i] = ((payload[i] << r2) | (payload[i] >> (8 - r2))) & 255
 
-        # Additional stream
         st = (seed ^ stream_a) & 0xFFFFFFFF
         for i in range(len(payload)):
             st = (st * 214013 + 2531011) & 0xFFFFFFFF
             payload[i] ^= (st >> 16) & 255
             payload[i] ^= (i * stream_b + xs) & 255
 
-        # Final transformations
         if mode >= 1:
             for i in range(len(payload)):
                 payload[i] = ((payload[i] & 0x0F) << 4) | ((payload[i] & 0xF0) >> 4)
@@ -117,7 +111,6 @@ class PirateObfuscator:
             for i in range(len(payload)):
                 payload[i] ^= (0x5A ^ (i * 7 + xs)) & 255
 
-        # Checksum
         csum = 0
         for b in payload:
             csum = (csum + b * csum_mul + (seed & 255)) & 0xFFFFFFFF
@@ -142,7 +135,6 @@ class PirateObfuscator:
 
     def generate_decoder(self, encrypted: List[int], meta: Dict) -> str:
         """Generate Lua decoder code that reverses the encryption."""
-        # Names
         bx = self.rn()
         bo = self.rn()
         ba = self.rn()
@@ -155,17 +147,11 @@ class PirateObfuscator:
         meta_tbl = self.rn()
         data_tbl = self.rn()
 
-        # Build the data table
-        # We'll split the encrypted bytes into chunks (like the example)
-        # The example uses a table with multiple sub-tables. We'll do the same.
-        data = encrypted
-        # We can use a single table of bytes, but to match the style, we'll split into chunks
-        # For simplicity, we'll create one big table.
-        data_str = "{" + ",".join(map(str, data)) + "}"
+        # Store encrypted data as a table of tables (only one)
+        data_str = "{" + ",".join(map(str, encrypted)) + "}"
+        data_tbl_def = f"local {data_tbl}={{{data_str}}}"
 
-        # Meta table
-        # We'll store: {mode, xs, seed, pi, keys, rots, adds, csum}
-        # keys is a table of tables, rots and adds are tables.
+        # Meta: set 4th element to 0 so that pi = 1
         keys_str = "{" + ",".join("{" + ",".join(map(str, k)) + "}" for k in meta['keys']) + "}"
         rots_str = "{" + ",".join(map(str, meta['rots'])) + "}"
         adds_str = "{" + ",".join(map(str, meta['adds'])) + "}"
@@ -173,15 +159,14 @@ class PirateObfuscator:
             str(meta['mode']),
             str(meta['xs']),
             str(meta['seed']),
-            "1",  # pi = 1 (index of data table)
+            "0",  # pi offset -> pi = 0+1 = 1
             keys_str,
             rots_str,
             adds_str,
             str(meta['csum'])
         ]) + "}"
-        meta_str = "{" + meta_entry + "}"  # Only one entry
+        meta_str = "{" + meta_entry + "}"
 
-        # Decoder function
         NKEYS = meta['NKEYS']
         pm = meta['pos_mul']
         cm = meta['csum_mul']
@@ -191,14 +176,14 @@ class PirateObfuscator:
         decoder = f"""
 local {bx},{bo},{ba},{bl},{br}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
 local {sch},{tcat}=string.char,table.concat
-local {data_tbl}={data_str}
+{data_tbl_def}
 local {meta_tbl}={meta_str}
 local {cache}={{}}
 local function {dec}(i)
 if {cache}[i]~=nil then return {cache}[i] end
 local m={meta_tbl}[i+1]
 local mode,xs,seed,pi,keys,rots,adds,expect=m[1],m[2],m[3],m[4]+1,m[5],m[6],m[7],m[8]
-local src={data_tbl} -- pi is always 1
+local src={data_tbl}[pi]
 local t,cs={{}},0
 for j=1,#src do t[j]=src[j] cs=(cs+src[j]*{cm}+{ba}(seed,255))%4294967296 end
 if cs~=expect then return '' end
@@ -223,21 +208,19 @@ local s={tcat}(out) {cache}[i]=s return s end
         return decoder, dec
 
     def obfuscate(self, source: str) -> str:
-        # 1. Minify the source
+        # Minify source
         minified = self.minify(source)
-        # If empty, just return header
         if not minified.strip():
             return HEADER + "\n" + minified
 
-        # 2. Encrypt the minified source as bytes (UTF-8)
+        # Encrypt
         payload_bytes = minified.encode('utf-8')
         encrypted, meta = self.encrypt_payload(payload_bytes)
 
-        # 3. Generate decoder
+        # Generate decoder
         decoder_code, dec_name = self.generate_decoder(encrypted, meta)
 
-        # 4. Build runner: decode the payload and loadstring
-        # We'll call the decoder with index 0 (since we only have one payload)
+        # Runner
         run = f"""
 local _payload={dec_name}(0)
 local _fn,_err=loadstring(_payload)
@@ -245,7 +228,7 @@ if not _fn then error(_err,0) end
 _fn()
 """
 
-        # 5. Add a table layer and junk (like the example)
+        # Table layer and junk
         env_name = self.rn()
         t1_name = self.rn()
         t2_name = self.rn()
@@ -258,8 +241,6 @@ local {k1}='{self.rn()}' local {k2}='{self.rn()}'
 {t1_name}[{k1}]=print {t1_name}[{k2}]=type 
 {t2_name}[1]={t1_name} {t2_name}[2]={env_name}
 """
-
-        # Add some junk local assignments
         junk = []
         for _ in range(random.randint(2, 5)):
             v = self.rn()
@@ -267,23 +248,14 @@ local {k1}='{self.rn()}' local {k2}='{self.rn()}'
             junk.append(f"local {v}={x}")
         junk_code = "\n".join(junk)
 
-        # Combine everything
         full = f"""
 {decoder_code}
 {table_layer}
 {junk_code}
 {run}
 """
-
-        # Wrap in IIFE with bit32 aliases at the top
-        # But decoder_code already has bit32 aliases, so we can just put it all in a function.
-        # The example had aliases outside the function, but we'll put them inside.
         final = f"(function() {full} end)()"
-
-        # Minify the final output (remove extra whitespace)
         final = re.sub(r'\s+', ' ', final).strip()
-
-        # Add header
         return HEADER + "\n" + final
 
 
