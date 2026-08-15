@@ -1,5 +1,5 @@
 """
-Discord Cog: Polymorphic multi‑stage obfuscator with round‑trip validation
+Discord Cog: Luau‑compatible multi‑stage obfuscator
 Command: /obf
 Header: --[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--
 """
@@ -50,14 +50,12 @@ def random_name(used: Set[str], length: int = 0) -> str:
             return name
 
 def minify_lua(code: str) -> str:
-    # Remove comments
     code = re.sub(r'--\[\[.*?\]\]|--[^\n]*', '', code, flags=re.DOTALL)
-    # Collapse whitespace
     code = re.sub(r'\s+', ' ', code).strip()
     return code
 
 # -----------------------------------------------------------------------------
-# 2. CRYPTOGRAPHIC PARAMETER GENERATION
+# 2. PARAMETER GENERATION
 # -----------------------------------------------------------------------------
 
 class CryptoParams:
@@ -69,26 +67,9 @@ class CryptoParams:
         self.rot_r = [random.randint(1, 7) for _ in range(self.rounds)]
         self.add_const = [random.randint(1, 220) for _ in range(self.rounds)]
         self.pos_mul = random.choice([11, 13, 17, 19, 23, 29, 31, 37])
-        # Permutation of length = payload_len
-        self.perm = random.sample(range(payload_len), payload_len) if payload_len > 0 else []
         self.stream_a = random.randint(1000, 99999)
         self.stream_b = random.randint(1000, 99999)
         self.integrity_seed = random.randint(1, 0xFFFFFFFF)
-
-    def serialize(self) -> Dict:
-        return {
-            'seed': self.seed,
-            'rounds': self.rounds,
-            'xor_keys': self.xor_keys,
-            'rot_l': self.rot_l,
-            'rot_r': self.rot_r,
-            'add_const': self.add_const,
-            'pos_mul': self.pos_mul,
-            'perm': self.perm,
-            'stream_a': self.stream_a,
-            'stream_b': self.stream_b,
-            'integrity_seed': self.integrity_seed,
-        }
 
 # -----------------------------------------------------------------------------
 # 3. ENCODER (Python)
@@ -118,11 +99,6 @@ class Encoder:
         return data
 
     @staticmethod
-    def apply_permutation(data: bytearray, perm: List[int]) -> bytearray:
-        # perm is a list of indices of length len(data)
-        return bytearray(data[p] for p in perm)
-
-    @staticmethod
     def apply_stream(data: bytearray, params: CryptoParams) -> bytearray:
         state = (params.seed ^ params.stream_a) & 0xFFFFFFFF
         for i in range(len(data)):
@@ -134,18 +110,13 @@ class Encoder:
     @staticmethod
     def encode(payload: bytes, params: CryptoParams) -> bytes:
         data = bytearray(payload)
-        # Stage 1: Permutation
-        if params.perm:
-            data = Encoder.apply_permutation(data, params.perm)
-        # Stage 2: Rounds
         for r in range(params.rounds):
             data = Encoder.apply_round(data, params, r)
-        # Stage 3: Streaming XOR
         data = Encoder.apply_stream(data, params)
         return bytes(data)
 
 # -----------------------------------------------------------------------------
-# 4. DECODER GENERATOR (Lua)
+# 4. DECODER GENERATOR (Lua) – uses bit32 and 1‑based indexing
 # -----------------------------------------------------------------------------
 
 class DecoderGenerator:
@@ -164,16 +135,14 @@ class DecoderGenerator:
         meta_tbl = random_name(used)
         data_tbl = random_name(used)
 
-        # Encrypted data as Lua table
         data_str = "{" + ",".join(map(str, encrypted)) + "}"
         data_tbl_def = f"local {data_tbl}={{{data_str}}}"
 
-        # Metadata
+        # Metadata: store per-round values as tables (1‑based in Lua)
         xor_str = "{" + ",".join(map(str, params.xor_keys)) + "}"
         rot_l_str = "{" + ",".join(map(str, params.rot_l)) + "}"
         rot_r_str = "{" + ",".join(map(str, params.rot_r)) + "}"
         add_str = "{" + ",".join(map(str, params.add_const)) + "}"
-        perm_str = "{" + ",".join(map(str, params.perm)) + "}"
         meta_entry = "{" + ",".join([
             str(params.seed),
             str(params.rounds),
@@ -182,87 +151,75 @@ class DecoderGenerator:
             rot_r_str,
             add_str,
             str(params.pos_mul),
-            perm_str,
             str(params.stream_a),
             str(params.stream_b),
             str(params.integrity_seed),
         ]) + "}"
         meta_str = "{" + meta_entry + "}"
 
-        # Decoder function
         decoder = f"""
+local {bx},{bo},{ba},{bl},{br}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
+local {sch},{tcat}=string.char,table.concat
+{data_tbl_def}
+local {meta_tbl}={meta_str}
+local {cache}={{}}
 local function {dec}(idx)
-    local m = {meta_tbl}[idx+1]
-    local seed, rounds, xor_keys, rot_l, rot_r, add_const, pos_mul, perm, stream_a, stream_b, integrity_seed =
-        m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10], m[11]
-    local src = {data_tbl}
-    local t = {{}}
-    for i = 1, #src do t[i] = src[i] end
+if {cache}[idx]~=nil then return {cache}[idx] end
+local m={meta_tbl}[idx+1]
+local seed, rounds, xor_keys, rot_l, rot_r, add_const, pos_mul, stream_a, stream_b, integrity_seed =
+    m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10]
+local src={data_tbl}
+local t={{}} for i=1,#src do t[i]=src[i] end
 
-    -- Reverse stream
-    local state = (seed ~ stream_a) & 0xFFFFFFFF
-    for i = 1, #t do
-        state = (state * 214013 + 2531011) & 0xFFFFFFFF
-        t[i] = t[i] ~ ((state >> 16) & 0xFF)
-        t[i] = t[i] ~ ((i - 1) * stream_b + (seed & 0xFF)) & 0xFF
-    end
+-- Reverse stream
+local state={bx}(seed,stream_a)
+for i=1,#t do
+    state=(state*214013+2531011)%4294967296
+    t[i]={bx}(t[i],{ba}({br}(state,16),255))
+    t[i]={bx}(t[i],{ba}((i-1)*stream_b+{ba}(seed,255),255))
+end
 
-    -- Reverse rounds
-    for r = rounds, 1, -1 do
-        local k = xor_keys[r]
-        local rot_lr = rot_l[r]
-        local rot_rr = rot_r[r]
-        local addc = add_const[r]
-        local fac = (r % 7) + 1
-        -- Inverse of rot_r (rotate left)
-        for i = 1, #t do
-            t[i] = ((t[i] << rot_rr) | (t[i] >> (8 - rot_rr))) & 0xFF
-        end
-        -- Inverse of position XOR (self-inverse)
-        for i = 1, #t do
-            t[i] = t[i] ~ ((i - 1) * pos_mul + (seed & 0xFF) + (r - 1) * 13) & 0xFF
-        end
-        -- Inverse of rot_l (rotate right)
-        for i = 1, #t do
-            t[i] = ((t[i] >> rot_lr) | (t[i] << (8 - rot_lr))) & 0xFF
-        end
-        -- Inverse of add
-        for i = 1, #t do
-            t[i] = (t[i] - addc - ((i - 1) * fac)) & 0xFF
-        end
-        -- Inverse of XOR
-        for i = 1, #t do
-            t[i] = t[i] ~ k
-        end
+-- Reverse rounds
+for r=rounds,1,-1 do
+    local k=xor_keys[r]
+    local rot_lr=rot_l[r]
+    local rot_rr=rot_r[r]
+    local addc=add_const[r]
+    local fac=(r%7)+1
+    -- Inverse of rot_r (rotate left)
+    for i=1,#t do
+        t[i]={bo}({bl}(t[i],rot_rr),{br}(t[i],8-rot_rr))
+        t[i]={ba}(t[i],255)
     end
+    -- Inverse of position XOR (self-inverse)
+    for i=1,#t do
+        t[i]={bx}(t[i],{ba}((i-1)*pos_mul+{ba}(seed,255)+(r-1)*13,255))
+    end
+    -- Inverse of rot_l (rotate right)
+    for i=1,#t do
+        t[i]={bo}({br}(t[i],rot_lr),{bl}(t[i],8-rot_lr))
+        t[i]={ba}(t[i],255)
+    end
+    -- Inverse of add
+    for i=1,#t do
+        t[i]=(t[i]-addc-((i-1)*fac))%256
+    end
+    -- Inverse of XOR
+    for i=1,#t do
+        t[i]={bx}(t[i],k)
+    end
+end
 
-    -- Reverse permutation: compute inverse permutation
-    -- perm is a list of indices, we need inv[perm[i]] = i
-    local inv = {{}}
-    for i = 1, #perm do
-        inv[perm[i] + 1] = i  -- Lua tables are 1-indexed
-    end
-    local out = {{}}
-    for i = 1, #t do
-        out[i] = t[inv[i]]
-    end
+-- Integrity check: FNV-1a
+local h=0x811C9DC5
+for i=1,#t do
+    h=({bx}(h,t[i])*0x01000193)%4294967296
+end
+if h~=integrity_seed then return nil end
 
-    -- Integrity check: FNV-1a on the decoded payload
-    local h = 0x811C9DC5
-    for i = 1, #out do
-        h = (h ~ out[i]) * 0x01000193
-        h = h & 0xFFFFFFFF
-    end
-    if h ~= integrity_seed then
-        return nil  -- corruption detected
-    end
-
-    -- Convert to string
-    local s = {{}}
-    for i = 1, #out do
-        s[i] = string.char(out[i])
-    end
-    return table.concat(s)
+-- Convert to string
+local out={{}} for i=1,#t do out[i]={sch}(t[i]) end
+local s={tcat}(out) {cache}[idx]=s return s
 end
 """
         return decoder, dec
@@ -290,22 +247,16 @@ class Obfuscator:
         return True
 
     def obfuscate(self, source: str) -> str:
-        # 1. Minify
         minified = minify_lua(source)
         if not minified.strip():
             return HEADER + "\n" + minified
 
-        # 2. Generate parameters based on payload length
         payload = minified.encode('utf-8')
         params = CryptoParams(len(payload))
-
-        # 3. Encode
         encrypted = Encoder.encode(payload, params)
 
-        # 4. Generate Lua decoder
         decoder_code, dec_name = DecoderGenerator.generate(params, encrypted)
 
-        # 5. Build final script
         loader = f"""
 local _payload = {dec_name}(0)
 if not _payload then error("Corrupted payload", 0) end
@@ -313,24 +264,21 @@ local _fn, _err = loadstring(_payload)
 if not _fn then error(_err, 0) end
 _fn()
 """
-        # Add a small table layer for extra confusion but keep it minimal
-        # We'll define some dummy locals that are unused (but not too many)
-        dummy = []
+        # Small junk for confusion
+        junk = []
         for _ in range(random.randint(1, 3)):
             v = self.rn()
-            dummy.append(f"local {v}={random.randint(1,100)}")
-        dummy_code = "\n".join(dummy)
+            junk.append(f"local {v}={random.randint(1,100)}")
+        junk_code = "\n".join(junk)
 
         full = f"""
 {decoder_code}
-{dummy_code}
+{junk_code}
 {loader}
 """
-        # Wrap in IIFE and minify
         final = f"(function(){full} end)()"
         final = re.sub(r'\s+', ' ', final).strip()
 
-        # Validate
         if not self._validate(final):
             raise RuntimeError("Obfuscation produced invalid Lua syntax")
 
@@ -350,7 +298,7 @@ class Obfuscation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="obf", description="Obfuscate a Luau file with polymorphic multi‑stage encryption")
+    @app_commands.command(name="obf", description="Obfuscate a Luau file with multi‑stage encryption")
     @app_commands.describe(file="Attach the .lua or .txt Luau source file to obfuscate")
     async def obf(self, interaction: discord.Interaction, file: discord.Attachment):
         if not file.filename.lower().endswith((".lua", ".txt")):
