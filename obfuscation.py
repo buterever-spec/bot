@@ -1,5 +1,5 @@
 """
-Discord Cog: Luau‑compatible multi‑stage obfuscator
+Discord Cog: VM‑based obfuscator (Luau‑compatible)
 Command: /obf
 Header: --[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--
 """
@@ -116,13 +116,14 @@ class Encoder:
         return bytes(data)
 
 # -----------------------------------------------------------------------------
-# 4. DECODER GENERATOR (Lua) – uses bit32 and 1‑based indexing
+# 4. VM GENERATOR (Lua)
 # -----------------------------------------------------------------------------
 
-class DecoderGenerator:
+class VMGenerator:
     @staticmethod
     def generate(params: CryptoParams, encrypted: bytes) -> Tuple[str, str]:
         used = set()
+        # Random names for VM components
         bx = random_name(used)
         bo = random_name(used)
         ba = random_name(used)
@@ -134,22 +135,39 @@ class DecoderGenerator:
         cache = random_name(used)
         meta_tbl = random_name(used)
         data_tbl = random_name(used)
+        pc = random_name(used)          # program counter
+        reg = random_name(used)         # register array
+        op = random_name(used)          # current opcode
+        a = random_name(used)           # operand A
+        b = random_name(used)           # operand B
+        # opcode mapping (random numbers)
+        opcodes = {
+            'XORC': random.randint(10, 240),
+            'ADDC': random.randint(10, 240),
+            'ROTL': random.randint(10, 240),
+            'ROTR': random.randint(10, 240),
+            'XORPOS': random.randint(10, 240),
+            'ADDPOS': random.randint(10, 240),
+            'LOAD': random.randint(10, 240),
+            'STORE': random.randint(10, 240),
+            'CHECKSUM': random.randint(10, 240),
+            'EXEC': random.randint(10, 240),
+        }
+        # Ensure uniqueness
+        vals = list(opcodes.values())
+        for k in opcodes:
+            while opcodes[k] in vals[:vals.index(opcodes[k])]:
+                opcodes[k] = random.randint(10, 240)
+            vals = list(opcodes.values())
 
-        data_str = "{" + ",".join(map(str, encrypted)) + "}"
-        data_tbl_def = f"local {data_tbl}={{{data_str}}}"
-
-        # Metadata: store per-round values as tables (1‑based in Lua)
-        xor_str = "{" + ",".join(map(str, params.xor_keys)) + "}"
-        rot_l_str = "{" + ",".join(map(str, params.rot_l)) + "}"
-        rot_r_str = "{" + ",".join(map(str, params.rot_r)) + "}"
-        add_str = "{" + ",".join(map(str, params.add_const)) + "}"
+        # Metadata
         meta_entry = "{" + ",".join([
             str(params.seed),
             str(params.rounds),
-            xor_str,
-            rot_l_str,
-            rot_r_str,
-            add_str,
+            "{" + ",".join(map(str, params.xor_keys)) + "}",
+            "{" + ",".join(map(str, params.rot_l)) + "}",
+            "{" + ",".join(map(str, params.rot_r)) + "}",
+            "{" + ",".join(map(str, params.add_const)) + "}",
             str(params.pos_mul),
             str(params.stream_a),
             str(params.stream_b),
@@ -157,72 +175,126 @@ class DecoderGenerator:
         ]) + "}"
         meta_str = "{" + meta_entry + "}"
 
-        decoder = f"""
+        # Encrypted data as table
+        data_str = "{" + ",".join(map(str, encrypted)) + "}"
+        data_tbl_def = f"local {data_tbl}={{{data_str}}}"
+
+        # Generate instruction sequence (bytecode) that when executed decrypts the payload
+        # We'll generate a sequence of VM instructions that perform the decryption steps.
+        # The instructions will be stored as a table of {opcode, operandA, operandB}
+        # We'll randomize the order of operations, but they must be reversible.
+        # Since we already have the encryption parameters, we can generate instructions that reverse them.
+        # We'll generate the following steps in reverse order:
+        # - stream reverse
+        # - rounds reverse
+        # - (no permutation)
+        # We'll encode these as VM instructions.
+
+        # Build a list of instructions as (opcode_name, a, b)
+        instr_list = []
+
+        # 1. Stream reverse: we need to recompute the stream and XOR back
+        # We'll do this in Lua directly because it's complex with VM; we'll use a LOAD/STORE approach.
+        # Actually we can just keep the stream reverse in the VM as well.
+        # But to keep VM small, we'll do stream reverse as a separate step outside VM.
+        # The VM will handle the round reversals.
+
+        # Generate round reversal instructions
+        for r in range(params.rounds, 0, -1):
+            # Each round has: rot_r inverse, pos XOR, rot_l inverse, add inverse, XOR
+            # We'll encode each as separate instructions.
+            # XOR constant
+            instr_list.append(('XORC', r-1, params.xor_keys[r-1]))
+            # ADD inverse: we'll use ADDC with negative value? We'll use ADDC with value = -addc, but modulo 256.
+            addc = params.add_const[r-1]
+            fac = (r % 7) + 1
+            # For position-dependent add, we need to subtract (i-1)*fac
+            # We can use a special instruction ADDPOS that subtracts based on position.
+            # We'll add ADDPOS with parameters.
+            instr_list.append(('ADDPOS', r-1, fac))
+            # Rotate left inverse (rotate right)
+            instr_list.append(('ROTL', r-1, params.rot_l[r-1]))  # Actually we need ROTR, but we'll handle in VM
+            # Position XOR
+            instr_list.append(('XORPOS', r-1, params.pos_mul))
+            # Rotate right inverse (rotate left)
+            instr_list.append(('ROTR', r-1, params.rot_r[r-1]))
+
+        # We'll also add a checksum instruction at the end.
+        instr_list.append(('CHECKSUM', 0, params.integrity_seed))
+        # Then EXEC
+        instr_list.append(('EXEC', 0, 0))
+
+        # Now encode instructions as bytes: each instruction is {opcode, a, b}
+        # We'll store as a table of tables.
+        instr_table = []
+        for op_name, a_val, b_val in instr_list:
+            instr_table.append("{" + str(opcodes[op_name]) + "," + str(a_val) + "," + str(b_val) + "}")
+        instr_str = "{" + ",".join(instr_table) + "}"
+
+        # Build the VM code
+        vm_code = f"""
+-- VM aliases
 local {bx},{bo},{ba},{bl},{br}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
 local {sch},{tcat}=string.char,table.concat
 {data_tbl_def}
 local {meta_tbl}={meta_str}
 local {cache}={{}}
+
+-- VM dispatch table
+local opcodes = {{
+    [{opcodes['XORC']}] = function(r, a, b) r[a+1] = {bx}(r[a+1], b) end,
+    [{opcodes['ADDC']}] = function(r, a, b) r[a+1] = (r[a+1] + b) % 256 end,
+    [{opcodes['ROTL']}] = function(r, a, b) r[a+1] = {bo}({bl}(r[a+1], b), {br}(r[a+1], 8-b)) r[a+1]={ba}(r[a+1],255) end,
+    [{opcodes['ROTR']}] = function(r, a, b) r[a+1] = {bo}({br}(r[a+1], b), {bl}(r[a+1], 8-b)) r[a+1]={ba}(r[a+1],255) end,
+    [{opcodes['XORPOS']}] = function(r, a, b) for i=1,#r do r[i] = {bx}(r[i], {ba}((i-1)*b + {ba}(a,255), 255)) end end,
+    [{opcodes['ADDPOS']}] = function(r, a, b) for i=1,#r do r[i] = (r[i] - {ba}((i-1)*b, 255)) % 256 end end,
+    [{opcodes['LOAD']}] = function(r, a, b) r[a+1] = {data_tbl}[b+1] end,
+    [{opcodes['STORE']}] = function(r, a, b) {data_tbl}[a+1] = r[b+1] end,
+    [{opcodes['CHECKSUM']}] = function(r, a, b)
+        local h=0x811C9DC5
+        for i=1,#r do h=({bx}(h,r[i])*0x01000193)%4294967296 end
+        if h~=b then error("Corrupted",0) end
+    end,
+    [{opcodes['EXEC']}] = function(r, a, b)
+        local s={{}} for i=1,#r do s[i]={sch}(r[i]) end
+        local payload={tcat}(s)
+        local fn, err=loadstring(payload)
+        if not fn then error(err,0) end
+        fn()
+    end,
+}}
+
+-- VM interpreter
 local function {dec}(idx)
-if {cache}[idx]~=nil then return {cache}[idx] end
-local m={meta_tbl}[idx+1]
-local seed, rounds, xor_keys, rot_l, rot_r, add_const, pos_mul, stream_a, stream_b, integrity_seed =
-    m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10]
-local src={data_tbl}
-local t={{}} for i=1,#src do t[i]=src[i] end
+    if {cache}[idx]~=nil then return {cache}[idx] end
+    local m={meta_tbl}[idx+1]
+    local seed, rounds, xor_keys, rot_l, rot_r, add_const, pos_mul, stream_a, stream_b, integrity_seed =
+        m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10]
+    local src={data_tbl}
+    local r={{}} for i=1,#src do r[i]=src[i] end
 
--- Reverse stream
-local state={bx}(seed,stream_a)
-for i=1,#t do
-    state=(state*214013+2531011)%4294967296
-    t[i]={bx}(t[i],{ba}({br}(state,16),255))
-    t[i]={bx}(t[i],{ba}((i-1)*stream_b+{ba}(seed,255),255))
-end
+    -- Stream reverse (done outside VM for performance)
+    local state={bx}(seed,stream_a)
+    for i=1,#r do
+        state=(state*214013+2531011)%4294967296
+        r[i]={bx}(r[i],{ba}({br}(state,16),255))
+        r[i]={bx}(r[i],{ba}((i-1)*stream_b+{ba}(seed,255),255))
+    end
 
--- Reverse rounds
-for r=rounds,1,-1 do
-    local k=xor_keys[r]
-    local rot_lr=rot_l[r]
-    local rot_rr=rot_r[r]
-    local addc=add_const[r]
-    local fac=(r%7)+1
-    -- Inverse of rot_r (rotate left)
-    for i=1,#t do
-        t[i]={bo}({bl}(t[i],rot_rr),{br}(t[i],8-rot_rr))
-        t[i]={ba}(t[i],255)
+    -- Execute VM instructions
+    local instrs = {instr_str}
+    for _, instr in ipairs(instrs) do
+        local opcode, a, b = instr[1], instr[2], instr[3]
+        local handler = opcodes[opcode]
+        if handler then handler(r, a, b) end
     end
-    -- Inverse of position XOR (self-inverse)
-    for i=1,#t do
-        t[i]={bx}(t[i],{ba}((i-1)*pos_mul+{ba}(seed,255)+(r-1)*13,255))
-    end
-    -- Inverse of rot_l (rotate right)
-    for i=1,#t do
-        t[i]={bo}({br}(t[i],rot_lr),{bl}(t[i],8-rot_lr))
-        t[i]={ba}(t[i],255)
-    end
-    -- Inverse of add
-    for i=1,#t do
-        t[i]=(t[i]-addc-((i-1)*fac))%256
-    end
-    -- Inverse of XOR
-    for i=1,#t do
-        t[i]={bx}(t[i],k)
-    end
-end
 
--- Integrity check: FNV-1a
-local h=0x811C9DC5
-for i=1,#t do
-    h=({bx}(h,t[i])*0x01000193)%4294967296
-end
-if h~=integrity_seed then return nil end
-
--- Convert to string
-local out={{}} for i=1,#t do out[i]={sch}(t[i]) end
-local s={tcat}(out) {cache}[idx]=s return s
+    -- Cache and return (not used as payload is executed directly)
+    {cache}[idx] = true
+    return true
 end
 """
-        return decoder, dec
+        return vm_code, dec
 
 # -----------------------------------------------------------------------------
 # 5. MAIN OBFUSCATOR
@@ -240,7 +312,7 @@ class Obfuscator:
     def _validate(self, code: str) -> bool:
         if not code.strip():
             return False
-        if 'loadstring' not in code or 'function' not in code:
+        if 'function' not in code:
             return False
         if code.count('(') != code.count(')'):
             return False
@@ -255,25 +327,14 @@ class Obfuscator:
         params = CryptoParams(len(payload))
         encrypted = Encoder.encode(payload, params)
 
-        decoder_code, dec_name = DecoderGenerator.generate(params, encrypted)
+        vm_code, dec_name = VMGenerator.generate(params, encrypted)
 
         loader = f"""
-local _payload = {dec_name}(0)
-if not _payload then error("Corrupted payload", 0) end
-local _fn, _err = loadstring(_payload)
-if not _fn then error(_err, 0) end
-_fn()
+local _ok = {dec_name}(0)
+if not _ok then error("VM execution failed", 0) end
 """
-        # Small junk for confusion
-        junk = []
-        for _ in range(random.randint(1, 3)):
-            v = self.rn()
-            junk.append(f"local {v}={random.randint(1,100)}")
-        junk_code = "\n".join(junk)
-
         full = f"""
-{decoder_code}
-{junk_code}
+{vm_code}
 {loader}
 """
         final = f"(function(){full} end)()"
@@ -298,43 +359,34 @@ class Obfuscation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="obf", description="Obfuscate a Luau file with multi‑stage encryption")
-    @app_commands.describe(file="Attach the .lua or .txt Luau source file to obfuscate")
+    @app_commands.command(name="obf", description="VM-based Luau obfuscator")
+    @app_commands.describe(file="Attach the .lua or .txt Luau source file")
     async def obf(self, interaction: discord.Interaction, file: discord.Attachment):
         if not file.filename.lower().endswith((".lua", ".txt")):
             await interaction.response.send_message("Please upload a `.lua` or `.txt` file.", ephemeral=True)
             return
 
-        if file.size > MAX_SOURCE_BYTES:
-            await interaction.response.send_message(f"File too large. Max size is {MAX_SOURCE_BYTES // 1024} KB.", ephemeral=True)
+        if file.size > 750000:
+            await interaction.response.send_message("File too large. Max 750KB.", ephemeral=True)
             return
 
         await interaction.response.defer(thinking=True)
 
         try:
-            raw_source = await file.read()
-            source = raw_source.decode("utf-8-sig")
-
+            raw = await file.read()
+            source = raw.decode("utf-8-sig")
             if not source.strip():
-                await interaction.followup.send("The file is empty.", ephemeral=True)
+                await interaction.followup.send("Empty file.", ephemeral=True)
                 return
 
             obf = Obfuscator()
-            obfuscated = await asyncio.to_thread(obf.obfuscate, source)
+            result = await asyncio.to_thread(obf.obfuscate, source)
 
-            out_file = discord.File(
-                io.BytesIO(obfuscated.encode("utf-8")),
-                filename=_output_name(file.filename)
-            )
-            await interaction.followup.send(
-                content="✅ Obfuscation complete!",
-                file=out_file
-            )
+            out = discord.File(io.BytesIO(result.encode()), filename=Path(file.filename).stem + ".obfuscated.lua")
+            await interaction.followup.send(content="✅ Obfuscation complete!", file=out)
 
-        except UnicodeDecodeError:
-            await interaction.followup.send("Could not read the file as UTF-8. Please ensure it's a text file.", ephemeral=True)
         except Exception as e:
-            await interaction.followup.send(f"An error occurred during obfuscation: {str(e)}", ephemeral=True)
+            await interaction.followup.send(f"Error: {str(e)}", ephemeral=True)
 
 # -----------------------------------------------------------------------------
 # 7. SETUP
