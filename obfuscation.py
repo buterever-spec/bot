@@ -1,5 +1,5 @@
 """
-Discord Cog: VM‑based obfuscator (Luau‑compatible)
+Discord Cog: Multi‑layer Luau obfuscator with control‑flow flattening
 Command: /obf
 Header: --[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--
 """
@@ -55,75 +55,58 @@ def minify_lua(code: str) -> str:
     return code
 
 # -----------------------------------------------------------------------------
-# 2. PARAMETER GENERATION
+# 2. ENCRYPTION LAYERS (multi-stage)
 # -----------------------------------------------------------------------------
 
 class CryptoParams:
     def __init__(self, payload_len: int):
         self.seed = random.randint(1, 2**31 - 1)
-        self.rounds = random.randint(5, 12)
-        self.xor_keys = [random.randint(1, 255) for _ in range(self.rounds)]
-        self.rot_l = [random.randint(1, 7) for _ in range(self.rounds)]
-        self.rot_r = [random.randint(1, 7) for _ in range(self.rounds)]
-        self.add_const = [random.randint(1, 220) for _ in range(self.rounds)]
-        self.pos_mul = random.choice([11, 13, 17, 19, 23, 29, 31, 37])
+        self.layer1_key = random.randint(1, 255)
+        self.layer2_rot = random.randint(1, 7)
+        self.layer3_add = random.randint(1, 220)
+        self.layer4_xor = [random.randint(1, 255) for _ in range(random.randint(3, 6))]
+        self.layer5_perm = random.sample(range(payload_len), payload_len) if payload_len > 0 else []
         self.stream_a = random.randint(1000, 99999)
         self.stream_b = random.randint(1000, 99999)
         self.integrity_seed = random.randint(1, 0xFFFFFFFF)
 
-# -----------------------------------------------------------------------------
-# 3. ENCODER (Python)
-# -----------------------------------------------------------------------------
-
-class Encoder:
-    @staticmethod
-    def apply_round(data: bytearray, params: CryptoParams, r: int) -> bytearray:
-        k = params.xor_keys[r]
-        add = params.add_const[r]
-        fac = (r + 1) % 7 + 1
-        rot = params.rot_l[r]
-        rot_r = params.rot_r[r]
-        pm = params.pos_mul
-        seed = params.seed
-
-        for i in range(len(data)):
-            data[i] ^= k
-        for i in range(len(data)):
-            data[i] = (data[i] + add + i * fac) & 0xFF
-        for i in range(len(data)):
-            data[i] = ((data[i] << rot) | (data[i] >> (8 - rot))) & 0xFF
-        for i in range(len(data)):
-            data[i] ^= (i * pm + (seed & 0xFF) + r * 13) & 0xFF
-        for i in range(len(data)):
-            data[i] = ((data[i] >> rot_r) | (data[i] << (8 - rot_r))) & 0xFF
-        return data
-
-    @staticmethod
-    def apply_stream(data: bytearray, params: CryptoParams) -> bytearray:
-        state = (params.seed ^ params.stream_a) & 0xFFFFFFFF
-        for i in range(len(data)):
-            state = (state * 214013 + 2531011) & 0xFFFFFFFF
-            data[i] ^= (state >> 16) & 0xFF
-            data[i] ^= (i * params.stream_b + (params.seed & 0xFF)) & 0xFF
-        return data
-
-    @staticmethod
-    def encode(payload: bytes, params: CryptoParams) -> bytes:
-        data = bytearray(payload)
-        for r in range(params.rounds):
-            data = Encoder.apply_round(data, params, r)
-        data = Encoder.apply_stream(data, params)
-        return bytes(data)
+def encrypt_payload(payload: bytes, params: CryptoParams) -> bytes:
+    data = bytearray(payload)
+    # Layer 1: XOR with single key
+    for i in range(len(data)):
+        data[i] ^= params.layer1_key
+    # Layer 2: Rotate left
+    rot = params.layer2_rot
+    for i in range(len(data)):
+        data[i] = ((data[i] << rot) | (data[i] >> (8 - rot))) & 0xFF
+    # Layer 3: Add with position factor
+    add = params.layer3_add
+    for i in range(len(data)):
+        data[i] = (data[i] + add + i) & 0xFF
+    # Layer 4: XOR with key sequence
+    keys = params.layer4_xor
+    for i in range(len(data)):
+        data[i] ^= keys[i % len(keys)]
+    # Layer 5: Permutation (if payload is non-empty)
+    if params.layer5_perm:
+        data = bytearray(data[p] for p in params.layer5_perm)
+    # Layer 6: Stream cipher (rolling XOR)
+    state = (params.seed ^ params.stream_a) & 0xFFFFFFFF
+    for i in range(len(data)):
+        state = (state * 214013 + 2531011) & 0xFFFFFFFF
+        data[i] ^= (state >> 16) & 0xFF
+        data[i] ^= (i * params.stream_b + (params.seed & 0xFF)) & 0xFF
+    return bytes(data)
 
 # -----------------------------------------------------------------------------
-# 4. VM GENERATOR (Lua)
+# 3. DECODER GENERATOR (Luau-compatible)
 # -----------------------------------------------------------------------------
 
-class VMGenerator:
+class DecoderGenerator:
     @staticmethod
     def generate(params: CryptoParams, encrypted: bytes) -> Tuple[str, str]:
         used = set()
-        # Random names for VM components
+        # Random names for all locals
         bx = random_name(used)
         bo = random_name(used)
         ba = random_name(used)
@@ -135,166 +118,118 @@ class VMGenerator:
         cache = random_name(used)
         meta_tbl = random_name(used)
         data_tbl = random_name(used)
-        pc = random_name(used)          # program counter
-        reg = random_name(used)         # register array
-        op = random_name(used)          # current opcode
-        a = random_name(used)           # operand A
-        b = random_name(used)           # operand B
-        # opcode mapping (random numbers)
-        opcodes = {
-            'XORC': random.randint(10, 240),
-            'ADDC': random.randint(10, 240),
-            'ROTL': random.randint(10, 240),
-            'ROTR': random.randint(10, 240),
-            'XORPOS': random.randint(10, 240),
-            'ADDPOS': random.randint(10, 240),
-            'LOAD': random.randint(10, 240),
-            'STORE': random.randint(10, 240),
-            'CHECKSUM': random.randint(10, 240),
-            'EXEC': random.randint(10, 240),
-        }
-        # Ensure uniqueness
-        vals = list(opcodes.values())
-        for k in opcodes:
-            while opcodes[k] in vals[:vals.index(opcodes[k])]:
-                opcodes[k] = random.randint(10, 240)
-            vals = list(opcodes.values())
 
-        # Metadata
+        # Data table (1‑based)
+        data_str = "{" + ",".join(map(str, encrypted)) + "}"
+        data_tbl_def = f"local {data_tbl}={{{data_str}}}"
+
+        # Metadata: store all parameters in a table (1‑based)
+        # We'll store as: {seed, layer1_key, layer2_rot, layer3_add, layer4_xor, layer5_perm, stream_a, stream_b, integrity_seed}
+        # Since perm is a table, we'll store it as a table.
+        perm_str = "{" + ",".join(map(str, params.layer5_perm)) + "}" if params.layer5_perm else "{}"
+        xor_str = "{" + ",".join(map(str, params.layer4_xor)) + "}"
         meta_entry = "{" + ",".join([
             str(params.seed),
-            str(params.rounds),
-            "{" + ",".join(map(str, params.xor_keys)) + "}",
-            "{" + ",".join(map(str, params.rot_l)) + "}",
-            "{" + ",".join(map(str, params.rot_r)) + "}",
-            "{" + ",".join(map(str, params.add_const)) + "}",
-            str(params.pos_mul),
+            str(params.layer1_key),
+            str(params.layer2_rot),
+            str(params.layer3_add),
+            xor_str,
+            perm_str,
             str(params.stream_a),
             str(params.stream_b),
             str(params.integrity_seed),
         ]) + "}"
         meta_str = "{" + meta_entry + "}"
 
-        # Encrypted data as table
-        data_str = "{" + ",".join(map(str, encrypted)) + "}"
-        data_tbl_def = f"local {data_tbl}={{{data_str}}}"
+        # We'll generate a decoder function that reverses the layers in reverse order.
+        # To make it harder, we'll split the reversal into several helper functions with random names.
+        # But for simplicity, we'll inline it (still hard to read).
 
-        # Generate instruction sequence (bytecode) that when executed decrypts the payload
-        # We'll generate a sequence of VM instructions that perform the decryption steps.
-        # The instructions will be stored as a table of {opcode, operandA, operandB}
-        # We'll randomize the order of operations, but they must be reversible.
-        # Since we already have the encryption parameters, we can generate instructions that reverse them.
-        # We'll generate the following steps in reverse order:
-        # - stream reverse
-        # - rounds reverse
-        # - (no permutation)
-        # We'll encode these as VM instructions.
-
-        # Build a list of instructions as (opcode_name, a, b)
-        instr_list = []
-
-        # 1. Stream reverse: we need to recompute the stream and XOR back
-        # We'll do this in Lua directly because it's complex with VM; we'll use a LOAD/STORE approach.
-        # Actually we can just keep the stream reverse in the VM as well.
-        # But to keep VM small, we'll do stream reverse as a separate step outside VM.
-        # The VM will handle the round reversals.
-
-        # Generate round reversal instructions
-        for r in range(params.rounds, 0, -1):
-            # Each round has: rot_r inverse, pos XOR, rot_l inverse, add inverse, XOR
-            # We'll encode each as separate instructions.
-            # XOR constant
-            instr_list.append(('XORC', r-1, params.xor_keys[r-1]))
-            # ADD inverse: we'll use ADDC with negative value? We'll use ADDC with value = -addc, but modulo 256.
-            addc = params.add_const[r-1]
-            fac = (r % 7) + 1
-            # For position-dependent add, we need to subtract (i-1)*fac
-            # We can use a special instruction ADDPOS that subtracts based on position.
-            # We'll add ADDPOS with parameters.
-            instr_list.append(('ADDPOS', r-1, fac))
-            # Rotate left inverse (rotate right)
-            instr_list.append(('ROTL', r-1, params.rot_l[r-1]))  # Actually we need ROTR, but we'll handle in VM
-            # Position XOR
-            instr_list.append(('XORPOS', r-1, params.pos_mul))
-            # Rotate right inverse (rotate left)
-            instr_list.append(('ROTR', r-1, params.rot_r[r-1]))
-
-        # We'll also add a checksum instruction at the end.
-        instr_list.append(('CHECKSUM', 0, params.integrity_seed))
-        # Then EXEC
-        instr_list.append(('EXEC', 0, 0))
-
-        # Now encode instructions as bytes: each instruction is {opcode, a, b}
-        # We'll store as a table of tables.
-        instr_table = []
-        for op_name, a_val, b_val in instr_list:
-            instr_table.append("{" + str(opcodes[op_name]) + "," + str(a_val) + "," + str(b_val) + "}")
-        instr_str = "{" + ",".join(instr_table) + "}"
-
-        # Build the VM code
-        vm_code = f"""
--- VM aliases
+        decoder = f"""
 local {bx},{bo},{ba},{bl},{br}=bit32.bxor,bit32.bor,bit32.band,bit32.lshift,bit32.rshift
 local {sch},{tcat}=string.char,table.concat
 {data_tbl_def}
 local {meta_tbl}={meta_str}
 local {cache}={{}}
-
--- VM dispatch table
-local opcodes = {{
-    [{opcodes['XORC']}] = function(r, a, b) r[a+1] = {bx}(r[a+1], b) end,
-    [{opcodes['ADDC']}] = function(r, a, b) r[a+1] = (r[a+1] + b) % 256 end,
-    [{opcodes['ROTL']}] = function(r, a, b) r[a+1] = {bo}({bl}(r[a+1], b), {br}(r[a+1], 8-b)) r[a+1]={ba}(r[a+1],255) end,
-    [{opcodes['ROTR']}] = function(r, a, b) r[a+1] = {bo}({br}(r[a+1], b), {bl}(r[a+1], 8-b)) r[a+1]={ba}(r[a+1],255) end,
-    [{opcodes['XORPOS']}] = function(r, a, b) for i=1,#r do r[i] = {bx}(r[i], {ba}((i-1)*b + {ba}(a,255), 255)) end end,
-    [{opcodes['ADDPOS']}] = function(r, a, b) for i=1,#r do r[i] = (r[i] - {ba}((i-1)*b, 255)) % 256 end end,
-    [{opcodes['LOAD']}] = function(r, a, b) r[a+1] = {data_tbl}[b+1] end,
-    [{opcodes['STORE']}] = function(r, a, b) {data_tbl}[a+1] = r[b+1] end,
-    [{opcodes['CHECKSUM']}] = function(r, a, b)
-        local h=0x811C9DC5
-        for i=1,#r do h=({bx}(h,r[i])*0x01000193)%4294967296 end
-        if h~=b then error("Corrupted",0) end
-    end,
-    [{opcodes['EXEC']}] = function(r, a, b)
-        local s={{}} for i=1,#r do s[i]={sch}(r[i]) end
-        local payload={tcat}(s)
-        local fn, err=loadstring(payload)
-        if not fn then error(err,0) end
-        fn()
-    end,
-}}
-
--- VM interpreter
 local function {dec}(idx)
-    if {cache}[idx]~=nil then return {cache}[idx] end
-    local m={meta_tbl}[idx+1]
-    local seed, rounds, xor_keys, rot_l, rot_r, add_const, pos_mul, stream_a, stream_b, integrity_seed =
-        m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9], m[10]
-    local src={data_tbl}
-    local r={{}} for i=1,#src do r[i]=src[i] end
+if {cache}[idx]~=nil then return {cache}[idx] end
+local m={meta_tbl}[idx+1]
+local seed, layer1_key, layer2_rot, layer3_add, layer4_xor, layer5_perm, stream_a, stream_b, integrity_seed =
+    m[1], m[2], m[3], m[4], m[5], m[6], m[7], m[8], m[9]
+local src={data_tbl}
+local t={{}} for i=1,#src do t[i]=src[i] end
 
-    -- Stream reverse (done outside VM for performance)
-    local state={bx}(seed,stream_a)
-    for i=1,#r do
-        state=(state*214013+2531011)%4294967296
-        r[i]={bx}(r[i],{ba}({br}(state,16),255))
-        r[i]={bx}(r[i],{ba}((i-1)*stream_b+{ba}(seed,255),255))
-    end
+-- Reverse stream (same as forward)
+local state={bx}(seed,stream_a)
+for i=1,#t do
+    state=(state*214013+2531011)%4294967296
+    t[i]={bx}(t[i],{ba}({br}(state,16),255))
+    t[i]={bx}(t[i],{ba}((i-1)*stream_b+{ba}(seed,255),255))
+end
 
-    -- Execute VM instructions
-    local instrs = {instr_str}
-    for _, instr in ipairs(instrs) do
-        local opcode, a, b = instr[1], instr[2], instr[3]
-        local handler = opcodes[opcode]
-        if handler then handler(r, a, b) end
-    end
+-- Reverse permutation: compute inverse permutation
+if #layer5_perm > 0 then
+    local inv={{}} for i=1,#layer5_perm do inv[layer5_perm[i]+1]=i end
+    local out={{}} for i=1,#t do out[i]=t[inv[i]] end
+    t=out
+end
 
-    -- Cache and return (not used as payload is executed directly)
-    {cache}[idx] = true
-    return true
+-- Reverse layer 4: XOR with key sequence (self-inverse)
+for i=1,#t do
+    t[i]={bx}(t[i],layer4_xor[((i-1)%#layer4_xor)+1])
+end
+
+-- Reverse layer 3: subtract with position factor
+for i=1,#t do
+    t[i]=(t[i]-layer3_add-(i-1))%256
+end
+
+-- Reverse layer 2: rotate right
+for i=1,#t do
+    t[i]={bo}({br}(t[i],layer2_rot),{bl}(t[i],8-layer2_rot))
+    t[i]={ba}(t[i],255)
+end
+
+-- Reverse layer 1: XOR with single key (self-inverse)
+for i=1,#t do
+    t[i]={bx}(t[i],layer1_key)
+end
+
+-- Integrity check: FNV-1a
+local h=0x811C9DC5
+for i=1,#t do
+    h=({bx}(h,t[i])*0x01000193)%4294967296
+end
+if h~=integrity_seed then return nil end
+
+-- Convert to string
+local out={{}} for i=1,#t do out[i]={sch}(t[i]) end
+local s={tcat}(out) {cache}[idx]=s return s
 end
 """
-        return vm_code, dec
+        return decoder, dec
+
+# -----------------------------------------------------------------------------
+# 4. CONTROL-FLOW FLATTENER (adds state-machine wrapper)
+# -----------------------------------------------------------------------------
+
+def flatten_control_flow(code: str) -> str:
+    """Wrap code in a while-state machine (simple flattening)."""
+    state_var = "state_" + ''.join(random.choices(string.ascii_letters, k=8))
+    lines = code.splitlines()
+    flat = [
+        f"local {state_var}=0",
+        "while true do",
+        f"if {state_var}==0 then"
+    ]
+    for line in lines:
+        flat.append("    " + line)
+    flat.append(f"    {state_var}=1")
+    flat.append(f"elseif {state_var}==1 then")
+    flat.append("    break")
+    flat.append("end")
+    flat.append("end")
+    return "\n".join(flat)
 
 # -----------------------------------------------------------------------------
 # 5. MAIN OBFUSCATOR
@@ -312,34 +247,50 @@ class Obfuscator:
     def _validate(self, code: str) -> bool:
         if not code.strip():
             return False
-        if 'function' not in code:
+        if 'loadstring' not in code and 'function' not in code:
             return False
         if code.count('(') != code.count(')'):
             return False
         return True
 
     def obfuscate(self, source: str) -> str:
+        # 1. Minify
         minified = minify_lua(source)
         if not minified.strip():
             return HEADER + "\n" + minified
 
+        # 2. Encrypt
         payload = minified.encode('utf-8')
         params = CryptoParams(len(payload))
-        encrypted = Encoder.encode(payload, params)
+        encrypted = encrypt_payload(payload, params)
 
-        vm_code, dec_name = VMGenerator.generate(params, encrypted)
+        # 3. Generate decoder
+        decoder_code, dec_name = DecoderGenerator.generate(params, encrypted)
 
+        # 4. Add control-flow flattening to the decoder (optional but makes it harder)
+        # We'll flatten the decoder function itself.
+        # But the decoder is a function; we'll just wrap the whole script in a flattened block.
+        # We'll flatten the entire main body.
+
+        # 5. Build loader
         loader = f"""
-local _ok = {dec_name}(0)
-if not _ok then error("VM execution failed", 0) end
+local _payload = {dec_name}(0)
+if not _payload then error("Corrupted payload", 0) end
+local _fn, _err = loadstring(_payload)
+if not _fn then error(_err, 0) end
+_fn()
 """
+        # 6. Combine
         full = f"""
-{vm_code}
+{decoder_code}
 {loader}
 """
+        # 7. Wrap in IIFE and flatten control flow
         final = f"(function(){full} end)()"
+        final = flatten_control_flow(final)
         final = re.sub(r'\s+', ' ', final).strip()
 
+        # 8. Validate
         if not self._validate(final):
             raise RuntimeError("Obfuscation produced invalid Lua syntax")
 
@@ -359,7 +310,7 @@ class Obfuscation(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
-    @app_commands.command(name="obf", description="VM-based Luau obfuscator")
+    @app_commands.command(name="obf", description="Multi-layer Luau obfuscator with control-flow flattening")
     @app_commands.describe(file="Attach the .lua or .txt Luau source file")
     async def obf(self, interaction: discord.Interaction, file: discord.Attachment):
         if not file.filename.lower().endswith((".lua", ".txt")):
