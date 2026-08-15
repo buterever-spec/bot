@@ -18,7 +18,7 @@ from discord.ext import commands
 # CONFIG
 # -----------------------------------------------------------------------------
 MAX_SOURCE_BYTES = 750_000
-ATTRIBUTION = "-- obfuscated by buterfuscate v17"
+ATTRIBUTION = "-- obfuscated by buterfuscate v18"
 OBFUSCATION_LEVEL = "MAX"
 
 # -----------------------------------------------------------------------------
@@ -55,7 +55,7 @@ def _compact(tokens: list[str]) -> str:
     return "".join(out)
 
 # -----------------------------------------------------------------------------
-# TOKENIZER (for minification and renaming)
+# TOKENIZER (for minification only)
 # -----------------------------------------------------------------------------
 class TokenKind:
     WHITESPACE = "whitespace"; COMMENT = "comment"; LONG_COMMENT = "long_comment"
@@ -210,17 +210,14 @@ def _mask_int(n: int) -> str:
         return f"({hex(n^a)}~{hex(a)})"
 
 # -----------------------------------------------------------------------------
-# STRING ENCRYPTION (variable split, rev, exact length)
+# STRING ENCRYPTION (stores metadata as a table)
 # -----------------------------------------------------------------------------
-def _pack_meta(split, seed, add, step, blk, rot, rev):
-    return (split & 0xF) | ((seed & 0xFF) << 4) | ((add & 0xFF) << 12) | ((step & 0x1F) << 20) | ((blk & 0xFF) << 25) | ((rot & 0x7) << 33) | ((rev & 0x1) << 36)
-
 def _encrypt_string(plain: str, seed: int) -> dict:
     bytes_ = _literal_bytes(plain)
     if bytes_ is None:
         raise ValueError(f"Invalid string literal: {plain}")
     n = len(bytes_)
-    if n == 0: return {"chunks": [[]], "meta": 0, "chk": 2166136261, "len": 0}
+    if n == 0: return {"chunks": [[]], "meta": [0,0,0,0,0,0,0], "chk": 2166136261, "len": 0}
     rng = random.Random(seed)
     split = rng.randint(2, 5)
     seed_val = rng.randint(1, 251); add = rng.randint(0, 250); step = rng.randint(1, 31)
@@ -233,47 +230,46 @@ def _encrypt_string(plain: str, seed: int) -> dict:
     for i, b in enumerate(s3): chunks[i % split].append(b)
     chk = 2166136261
     for b in bytes_: chk = ((chk ^ b) * 16777619) & 0xFFFFFFFF
-    meta = _pack_meta(split, seed_val, add, step, blk, rot, rev)
+    meta = [split, seed_val, add, step, blk, rot, rev]
     return {"chunks": chunks, "meta": meta, "chk": chk, "len": n}
 
 # -----------------------------------------------------------------------------
-# DECODER RUNTIME (native bitwise ops, with error printing)
+# DECODER RUNTIME (native bitwise ops, metadata as table)
 # -----------------------------------------------------------------------------
 def generate_runtime(record: dict, used: set) -> str:
     N = lambda: _fresh(used, confuse=False)
-    # short names
     xor, bor, band, lshift, rshift = N(), N(), N(), N(), N()
     char, concat, floor = N(), N(), N()
     trap, meta_tbl, chunk_tbl, len_tbl, chk_tbl, cache, decode_fn = N(), N(), N(), N(), N(), N(), N()
 
-    meta = [str(hex(record["meta"]))]
+    # meta is a table of 7 numbers
+    meta = "{" + ",".join(str(hex(x)) for x in record["meta"]) + "}"
     chunk_strs = ["{" + ",".join(hex(b) for b in ch) + "}" for ch in record["chunks"]]
-    chunks = ["{" + ",".join(chunk_strs) + "}"]
-    lens = [str(hex(record["len"]))]
-    chks = [str(hex(record["chk"]))]
+    chunks = "{" + ",".join(chunk_strs) + "}"
+    lens = str(hex(record["len"]))
+    chks = str(hex(record["chk"]))
 
     runtime = f"""local {xor},{bor},{band},{lshift},{rshift}=function(a,b)return a~b end,function(a,b)return a|b end,function(a,b)return a&b end,function(a,b)return a<<b end,function(a,b)return a>>b end
 local {char},{concat},{floor}=string.char,table.concat,math.floor
 local {trap}=function()error("",0)end
-local {meta_tbl}={{{",".join(meta)}}}
-local {chunk_tbl}={{{",".join(chunks)}}}
-local {len_tbl}={{{",".join(lens)}}}
-local {chk_tbl}={{{",".join(chks)}}}
+local {meta_tbl}={meta}
+local {chunk_tbl}={chunks}
+local {len_tbl}={lens}
+local {chk_tbl}={chks}
 local {cache}={{}}
 local function {decode_fn}(idx)
 if {cache}[idx] then return {cache}[idx] end
-local m={meta_tbl}[idx+1]
-local n={len_tbl}[idx+1]
-local expected={chk_tbl}[idx+1]
-if not m then {trap}() end
-local split={band}(m,0xF)
-local seed={band}({rshift}(m,0x4),0xFF)
-local add={band}({rshift}(m,0xC),0xFF)
-local step={band}({rshift}(m,0x14),0x1F)
-local blk={band}({rshift}(m,0x19),0xFF)
-local rot={band}({rshift}(m,0x21),0x7)
-local rev={band}({rshift}(m,0x24),0x1)
-local chunks={chunk_tbl}[idx+1]
+local m={meta_tbl}
+local n={len_tbl}
+local expected={chk_tbl}
+local split=m[1]
+local seed=m[2]
+local add=m[3]
+local step=m[4]
+local blk=m[5]
+local rot=m[6]
+local rev=m[7]
+local chunks={chunk_tbl}
 local out={{}}; local chk=0x81F
 for i=1,n do
 local ci=(i-1)%split+1
@@ -299,8 +295,9 @@ local result={concat}(out)
 return result
 end
 local payload={decode_fn}(0)
-local ok, result = pcall(function() local fn, err = loadstring(payload) if not fn then error(err,0) end fn() end)
-if not ok then print("Obfuscated loader error:", result) end"""
+local fn, err=loadstring(payload)
+if not fn then error(err,0) end
+fn()"""
     return runtime
 
 # -----------------------------------------------------------------------------
