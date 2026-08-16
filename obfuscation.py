@@ -236,6 +236,8 @@ class StringPool:
         self._map:Dict[str,str]={}
         self._ref_ids:List[int]=[]   # random ref_id per pool entry
         self._used_refs:Set[int]=set()
+        self.vm_key:int=0            # set by PremObf after construction
+        self.vm_key_name:str=""      # Lua upvalue name, set by PremObf
 
     def _mk_key(self): return [random.randint(1,255) for _ in range(random.randint(5,12))]
 
@@ -320,6 +322,7 @@ class StringPool:
             "if "+self.cache+"[i]~=nil then return "+self.cache+"[i] end",
             "local m="+M+"[i]",
             "local mode,xs,seed,pi,keys,rots,adds,expect=m[1],m[2],m[3],m[4]+1,m[5],m[6],m[7],m[8]",
+            "seed="+bx+"(seed,"+self.vm_key_name+")",
             "local src="+self.arr+"[pi] local t,cs={},0",
             "for j=1,#src do t[j]=src[j] cs=(cs+src[j]*"+str(cm)+"+"+ba+"(seed,255))%4294967296 end",
             "if cs~=expect then return '' end",
@@ -353,6 +356,11 @@ class PremObf:
         self.bl=self.namer(10); self.br=self.namer(10)
         self.sch=self.namer(10); self.tcat=self.namer(10)
         self.pool=StringPool(self.namer,self.bx,self.bo,self.ba,self.bl,self.br,self.sch,self.tcat)
+        # Per-build runtime key — pre-XOR'd into all seeds, recovered by VM at runtime
+        self.vm_key=random.randint(0x1000,0xFFFFFF)
+        self.vm_key_name=self.namer(9)   # Lua upvalue shared between VM and decoder
+        self.pool.vm_key=self.vm_key
+        self.pool.vm_key_name=self.vm_key_name
         self.num_pool:List[int]=[]; self.num_name:str|None=None; self.num_map:Dict[int,int]={}
 
     def aliases(self)->str:
@@ -539,8 +547,12 @@ class PremObf:
         mba_initacc=self.mba(integrity_acc[0]) if integrity_acc else "0"
 
         # ── EXEC handler body ─────────────────────────────────────────────────
+        # MBA-mask the real vm_key for the EXEC handler
+        mba_vmkey=self.mba(self.vm_key)
         exec_body=(f"local {vTMP}=math.floor({vW}/{mba_da})%256 "
-                   f"{vF}={vK}[{vTMP}] if type({vF})=='function' then {vF}() end")
+                   f"{self.vm_key_name}={mba_vmkey} "   # set upvalue so decoder works
+                   f"{vF}={vK}[{vTMP}] if type({vF})=='function' then {vF}() end "
+                   f"{self.vm_key_name}=0")              # reset after payload (cleanup)
 
         # ── Build handler table ───────────────────────────────────────────────
         # Junk slots are diversified: each does something visually distinct
@@ -608,10 +620,11 @@ class PremObf:
         toks=self.literals(self.rename(tokenize(src)))
         body=join_toks(toks)
         body=sp(self.fake_cf(),self.junk(5),body)
-        # Decoder lives OUTSIDE the VM closure so it's not mixed with payload
+        # Upvalue shared between VM and decoder: starts at 0, VM sets real value before payload
+        upvalue_decl="local "+self.vm_key_name+"=0"
         decoder=sp(self.pool.runtime(),self.num_pool_runtime())
         vm=self.make_vm(body)
-        code=self.aliases()+"(function(...) "+decoder+" "+vm+" end)()"
+        code=self.aliases()+"(function(...) "+upvalue_decl+" "+decoder+" "+vm+" end)()"
         return BANNER+minify(code)
 
 
