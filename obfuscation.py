@@ -234,6 +234,8 @@ class StringPool:
         self.stream_a=random.randint(1000,99999)
         self.stream_b=random.randint(1000,99999)
         self._map:Dict[str,str]={}
+        self._ref_ids:List[int]=[]   # random ref_id per pool entry
+        self._used_refs:Set[int]=set()
 
     def _mk_key(self): return [random.randint(1,255) for _ in range(random.randint(5,12))]
 
@@ -265,14 +267,33 @@ class StringPool:
         csum=0
         for b in data: csum=(csum+b*self.csum_mul+(seed&255))&0xFFFFFFFF
         idx=len(self.blobs); self.blobs.append(data); self.meta.append((mode,xs,seed,keys,rots,adds,csum))
-        ref=self.dec+"("+self.bx+"("+str(idx^self.idx_key)+","+str(self.idx_key)+"))"
+        # Assign a random ref_id with no mathematical relation to idx
+        ref_id=random.randint(1000,65000)
+        while ref_id in self._used_refs: ref_id=random.randint(1000,65000)
+        self._used_refs.add(ref_id)
+        self._ref_ids.append(ref_id)
+        # Encode ref_id at call site with per-call MBA (different constants each time)
+        c=random.randint(5,250)
+        style=random.randint(0,3)
+        if style==0:   call_expr=f"(({ref_id+c})-{c})"
+        elif style==1: call_expr=f"(({ref_id*3})//{3})"
+        elif style==2: call_expr=f"{self.bx}({ref_id^c},{c})"
+        else:          call_expr=f"(({ref_id+c*2})-{c*2})"
+        ref=self.dec+"("+call_expr+")"
         self._map[s]=ref; return ref
 
     def add(self,s): return self._enc(s)
     def split_add(self,s):
         if len(s)<4: return self._enc(s)
+        # Split into 2 or 3 parts randomly
+        if len(s)>=8 and random.random()<0.4:
+            p1=random.randint(1,len(s)//3)
+            p2=random.randint(p1+1,len(s)-1)
+            return "("+self._enc(s[:p1])+".."+self._enc(s[p1:p2])+".."+self._enc(s[p2:])+")"
         mid=random.randint(1,len(s)-1)
-        return "("+self._enc(s[:mid])+".."+self._enc(s[mid:])+")"
+        # Randomly vary the concat form
+        a=self._enc(s[:mid]); b=self._enc(s[mid:])
+        return "("+a+".."+b+")"
 
     def runtime(self)->str:
         if not self.blobs: return "local function "+self.dec+"(i) return '' end"
@@ -285,7 +306,9 @@ class StringPool:
         for i,(mode,xs,seed,keys,rots,adds,csum) in enumerate(self.meta):
             ks=",".join("{"+",".join(map(str,k))+"}" for k in keys)
             rs=",".join(map(str,rots)); ads=",".join(map(str,adds))
-            meta.append("{"+str(mode)+","+str(xs)+","+str(seed)+","+str(inv[i])
+            ref_id=self._ref_ids[i]  # use the random ref_id as key
+            meta.append("["+str(ref_id)+"]={"
+                        +str(mode)+","+str(xs)+","+str(seed)+","+str(inv[i])
                         +",{"+ks+"},{"+rs+"},{"+ads+"},"+str(csum)+"}")
         M=self.rn(10); bx,bo,ba,bl,br=self.bx,self.bo,self.ba,self.bl,self.br
         sch,tcat=self.sch,self.tcat; pm,cm,sa,sb=self.pos_mul,self.csum_mul,self.stream_a,self.stream_b
@@ -295,7 +318,7 @@ class StringPool:
             "local "+self.cache+"={}",
             "local function "+self.dec+"(i)",
             "if "+self.cache+"[i]~=nil then return "+self.cache+"[i] end",
-            "local m="+M+"[i+1]",
+            "local m="+M+"[i]",
             "local mode,xs,seed,pi,keys,rots,adds,expect=m[1],m[2],m[3],m[4]+1,m[5],m[6],m[7],m[8]",
             "local src="+self.arr+"[pi] local t,cs={},0",
             "for j=1,#src do t[j]=src[j] cs=(cs+src[j]*"+str(cm)+"+"+ba+"(seed,255))%4294967296 end",
