@@ -439,23 +439,16 @@ class PremObf:
     # accumulators and causes a mismatch at a random future checkpoint.
 
     def make_vm(self,body:str)->str:
-        SLOTS=64   # dispatch table size (power of 2)
+        SLOTS=64  # dispatch table size, power of 2
 
-        # Logical opcodes
-        OPS=["EXEC","NOP1","NOP2","NOP3","DEAD1","DEAD2"]
-        # EXEC = call the payload closure; rest are junk
-        n_ops=len(OPS)
-        # Assign random slot indices to opcodes
+        # ── Opcode slot assignment (per-build random) ─────────────────────────
+        # We have one real opcode (EXEC) and several diversified junk opcodes.
+        # Each junk slot does something different so the table isn't uniformly empty.
         all_slots=list(range(SLOTS)); random.shuffle(all_slots)
-        op_slots={op:all_slots[i] for i,op in enumerate(OPS)}
-        exec_slot=op_slots["EXEC"]
+        exec_slot=all_slots[0]
+        junk_slots=all_slots[1:random.randint(10,18)]  # 9-17 junk slots
 
-        # Per-build extraction constants for A/B/C
-        # A = floor(w / 64) % 256,  B = floor(w / 16384) % 256,  C = floor(w/4194304)%256
-        # These divisors are powers of 2 (2^6, 2^14, 2^22) — we'll MBA-mask them
-        DIV_A=64; DIV_B=16384; DIV_C=4194304
-
-        # Build K table: payload at randomised index, decoys around it
+        # ── K table: payload at randomised index, decoys around it ────────────
         real_k=random.randint(3,9)
         k_entries={}
         for i in range(1,real_k):
@@ -463,144 +456,130 @@ class PremObf:
         k_entries[real_k]=f"function() {body} end"
         for i in range(real_k+1,real_k+random.randint(2,4)):
             dv=self.namer(); k_entries[i]=f"function() local {dv}=0 end"
-        # Shuffle order in literal (indices still explicit)
         items=list(k_entries.items()); random.shuffle(items)
         k_lit="{"+",".join(f"[{ki}]={kv}" for ki,kv in items)+"}"
 
-        # The EXEC instruction encodes real_k in field A
-        # Instruction: slot=exec_slot, A=real_k, B=0, C=0
+        # ── Instruction packing: (slot&63) | (A<<6) | (B<<14) | (C<<22) ──────
         def pack(slot,A=0,B=0,C=0):
             return (slot&63)|((A&255)<<6)|((B&255)<<14)|((C&255)<<22)
 
-        # Build program: junk NOPs + EXEC + more junk
+        # ── Build logical instruction stream ──────────────────────────────────
+        # All junk before and after EXEC, so EXEC position is non-obvious
+        junk_op_list=junk_slots if junk_slots else [all_slots[1]]
         prog_logical=[]
-        for _ in range(random.randint(3,6)):
-            prog_logical.append(pack(random.choice([op_slots["NOP1"],op_slots["NOP2"],
-                                                     op_slots["NOP3"],op_slots["DEAD1"],
-                                                     op_slots["DEAD2"]]),
+        for _ in range(random.randint(4,8)):
+            prog_logical.append(pack(random.choice(junk_op_list),
                                      random.randint(0,255),random.randint(0,255),random.randint(0,255)))
+        exec_pos=len(prog_logical)  # track where EXEC sits
         prog_logical.append(pack(exec_slot,real_k,0,0))
-        # Trailing junk
-        for _ in range(random.randint(2,5)):
-            prog_logical.append(pack(random.choice([op_slots["NOP1"],op_slots["NOP2"],
-                                                     op_slots["DEAD1"],op_slots["DEAD2"]]),
+        for _ in range(random.randint(3,7)):
+            prog_logical.append(pack(random.choice(junk_op_list),
                                      random.randint(0,255),random.randint(0,255),random.randint(0,255)))
 
-        # Encrypt program: each word XOR'd with LCG stream
-        ek1=random.randint(1,0xFFFF); ek2=random.randint(1,0xFFFF)
+        # ── Encrypt stream with LCG (same source of truth for integrity) ──────
+        ek1=random.randint(1,0xFFFF)
         enc_prog=[]
         lcg=ek1
         for w in prog_logical:
             lcg=(lcg*1664525+1013904223)&0xFFFFFFFF
-            enc_prog.append(w^(lcg&0x3FFFFFFF))  # 30-bit mask
+            enc_prog.append(w^(lcg&0x3FFFFFFF))
 
-        # Rolling integrity checkpoints
-        # Every chk_interval instructions, accumulator is checked
-        chk_interval=random.randint(3,5)
-        # Compute expected accumulators at each checkpoint
+        # ── Integrity: checksum for EVERY instruction, derived from enc_prog ──
+        # acc[i] = rolling XOR of all enc_prog[0..i] mixed with position*salt
+        # We store ALL of them so every single instruction is verified.
+        # Key insight: we use enc_prog (the actual emitted values) not prog_logical,
+        # so the table and the stream are guaranteed to match.
+        integrity_salt=random.randint(0x100,0xFFFF)
         acc=random.randint(0x1000,0xFFFF)
-        fib_a_init,fib_b_init=random.randint(1,99),random.randint(1,99)
-        fib_a,fib_b=fib_a_init,fib_b_init
-        checkpoints={}  # pc → expected_acc
-        for i,w in enumerate(prog_logical):
-            acc=(acc^w^(fib_a*(i+1)))&0xFFFFFFFF
-            fib_a,fib_b=fib_b,(fib_a+fib_b)&0xFFFF
-            if (i+1)%chk_interval==0:
-                checkpoints[i+1]=acc
-        # We'll embed checkpoints as a table {[pc]=expected,...}
-        chk_entries=",".join(f"[{pc}]={v}" for pc,v in checkpoints.items())
-        chk_init_acc=self.mba(list(checkpoints.values())[0]) if checkpoints else "0"
+        integrity_acc=[]  # one expected value per instruction (1-indexed)
+        for i,w in enumerate(enc_prog):
+            acc=(acc^w^((i+1)*integrity_salt))&0xFFFFFFFF
+            integrity_acc.append(acc)
+        # Embed as flat array (index = instruction number, 1-based)
+        int_lit="{"+",".join(map(str,integrity_acc))+"}"
 
-        # Variable names
-        N=self.namer; rn=N
-        vK=rn(9); vH=rn(9); vS=rn(9); vP=rn(9); vW=rn(9)
-        vF=rn(9); vLCG=rn(8); vEK1=rn(8); vEK2=rn(8)
-        vCHK=rn(9); vCHKT=rn(10); vACC=rn(9); vFIBA=rn(8); vFIBB=rn(8)
-        vTMP=rn(9); vSLOTS=rn(9)
+        # ── Variable names ─────────────────────────────────────────────────────
+        N=self.namer
+        vK=N(9); vH=N(9); vS=N(9); vP=N(9); vW=N(9)
+        vF=N(9); vLCG=N(8); vTMP=N(9); vDFL=N(10)
+        vIT=N(9)   # integrity table
+        vIA=N(9)   # integrity accumulator
+        vSALT=N(8) # integrity salt
         ba=self.ba; bx=self.bx; bo=self.bo; bl=self.bl; br=self.br
 
-        # MBA-masked constants
-        mba_da=self.mba(DIV_A); mba_db=self.mba(DIV_B); mba_dc=self.mba(DIV_C)
+        mba_da=self.mba(64)
         mba_sl=self.mba(SLOTS)
-        mba_ek1=self.mba(ek1); mba_ek2=self.mba(ek2)
+        mba_ek1=self.mba(ek1)
         mba_lcg_m=self.mba(1664525); mba_lcg_c=self.mba(1013904223)
         mba_mask=self.mba(0x3FFFFFFF)
+        mba_salt=self.mba(integrity_salt)
+        mba_initacc=self.mba(integrity_acc[0]) if integrity_acc else "0"
 
-        # Build full dispatch table:
-        #   All SLOTS entries default to no-op, then real handlers overwrite
-        #   EXEC handler: extracts A = floor(w/64)%256, calls K[A]
+        # ── EXEC handler body ─────────────────────────────────────────────────
         exec_body=(f"local {vTMP}=math.floor({vW}/{mba_da})%256 "
                    f"{vF}={vK}[{vTMP}] if type({vF})=='function' then {vF}() end")
 
-        # Build handler assignments in random order
-        assigns=[]
-        # Default all slots
-        vDFL=rn(10)
-        assigns.append(f"local {vDFL}=function({vW}) end")
-        assigns.append(f"for {vTMP}=0,{mba_sl}-1 do {vH}[{vTMP}]={vDFL} end")
-        # Real handlers (shuffled)
-        real_assigns=[
-            f"{vH}[{exec_slot}]=function({vW}) {exec_body} end",
+        # ── Build handler table ───────────────────────────────────────────────
+        # Junk slots are diversified: each does something visually distinct
+        # but all evaluate to nothing useful. This makes the table look like
+        # a real multi-opcode VM rather than a camouflage layer.
+        used_slots={exec_slot}|set(junk_slots)
+        handler_lines=[]
+        handler_lines.append(f"local {vDFL}=function({vW}) end")
+        handler_lines.append(f"for {vTMP}=0,{mba_sl}-1 do {vH}[{vTMP}]={vDFL} end")
+
+        real_assigns=[f"{vH}[{exec_slot}]=function({vW}) {exec_body} end"]
+        # Diversified junk opcodes — each pattern is different
+        junk_patterns=[
+            lambda sl,v1,v2: f"{vH}[{sl}]=function({vW}) local {v1}=math.floor({vW}/{mba_da})%256 end",
+            lambda sl,v1,v2: f"{vH}[{sl}]=function({vW}) local {v1}={bx}({vW},{mba_mask}) local {v2}={v1} end",
+            lambda sl,v1,v2: f"{vH}[{sl}]=function({vW}) local {v1}={vW}%{mba_sl} end",
+            lambda sl,v1,v2: f"{vH}[{sl}]=function({vW}) end",
+            lambda sl,v1,v2: f"{vH}[{sl}]=function({vW}) local {v1}={ba}({vW},255) end",
         ]
-        # Junk handlers that look real but do nothing meaningful
-        used_slots={exec_slot}
-        for op in ["NOP1","NOP2","NOP3","DEAD1","DEAD2"]:
-            sl=op_slots[op]; used_slots.add(sl)
-            dv=rn(); dv2=rn()
-            real_assigns.append(f"{vH}[{sl}]=function({vW}) end")
-        # Extra totally dead slots with varying patterns
-        dead_slots=set()
-        while len(dead_slots)<random.randint(8,14):
+        for idx,sl in enumerate(junk_slots):
+            v1=N(); v2=N()
+            pat=junk_patterns[idx%len(junk_patterns)]
+            real_assigns.append(pat(sl,v1,v2))
+        # A few extra totally-empty slots beyond the named ones
+        extra=set()
+        while len(extra)<random.randint(4,8):
             s=random.randint(0,SLOTS-1)
-            if s not in used_slots: dead_slots.add(s)
-        for sl in dead_slots:
-            dv=rn()
-            real_assigns.append(f"{vH}[{sl}]=function({vW}) local {dv}=0 end")
+            if s not in used_slots: extra.add(s)
+        for sl in extra:
+            real_assigns.append(f"{vH}[{sl}]=function({vW}) end")
         random.shuffle(real_assigns)
-        assigns+=real_assigns
+        handler_lines+=real_assigns
 
-        # Checkpoint table
-        chk_table=f"local {vCHKT}={{{chk_entries}}}" if checkpoints else f"local {vCHKT}={{}}"
-
-        # Rolling integrity init
-        # We store the initial acc value and re-derive; simpler: just store table and check inline
-        vACC_CUR=rn(9); vFIBA2=rn(8); vFIBB2=rn(8); vIDX=rn(8)
-
-        vm_code=sp(
+        # ── Assemble VM code ──────────────────────────────────────────────────
+        parts=[
             f"local {vK}={k_lit}",
             f"local {vH}={{}}",
             f"local {vS}={{{','.join(map(str,enc_prog))}}}",
+            f"local {vIT}={int_lit}",   # integrity table (one entry per instruction)
             f"local {vP}=1",
             f"local {vF}=nil",
             f"local {vW}=0",
             f"local {vLCG}={mba_ek1}",
-            f"local {vACC_CUR}=0",
-            f"local {vFIBA2}={fib_a_init}",
-            f"local {vFIBB2}={fib_b_init}",
-            f"local {vIDX}=0",
-            chk_table,
-            *assigns,
+            f"local {vIA}=0",
+            f"local {vSALT}={mba_salt}",
+            *handler_lines,
             f"if #{vS}==0 then return end",
             f"while {vP}<=#{vS} do",
-            # Decrypt instruction: XOR with LCG stream
+            # Decrypt
             f"{vLCG}=({vLCG}*{mba_lcg_m}+{mba_lcg_c})%4294967296",
             f"{vW}={bx}({vS}[{vP}],{ba}({vLCG},{mba_mask}))",
-            # Rolling integrity update
-            f"{vIDX}={vIDX}+1",
-            f"{vACC_CUR}={ba}({bx}({vACC_CUR},{bx}({vW},{ba}({vFIBA2}*{vIDX},4294967295))),4294967295)",
-            f"local {vFIBA2},{vFIBB2}={vFIBB2},{ba}({vFIBA2}+{vFIBB2},65535)",
-            # Check checkpoint if present
-            f"if {vCHKT}[{vIDX}]~=nil and {vCHKT}[{vIDX}]~={vACC_CUR} then error(\"integrity\",0) end",
-            # Dispatch
+            # Integrity: update acc with the ENCRYPTED word (same as what we stored)
+            f"{vIA}={ba}({bx}({vIA},{bx}({vS}[{vP}],{ba}({vP}*{vSALT},4294967295))),4294967295)",
+            # Check EVERY instruction
+            f"if {vIT}[{vP}]~={vIA} then error(\"integrity\",0) end",
+            # Dispatch on decrypted word
             f"local {vTMP}={vH}[{vW}%{mba_sl}]",
             f"if {vTMP} then {vTMP}({vW}) end",
             f"{vP}={vP}+1",
             "end",
-        )
-        # Fix: vFIBA2/vFIBB2 shadow themselves in the loop — use separate names
-        # The line "local vFIBA2,vFIBB2=..." creates new locals each iter, which is fine in Lua
-        return vm_code.replace(f"local {vFIBA2},{vFIBB2}={vFIBB2},{ba}({vFIBA2}+{vFIBB2},65535)",
-                               f"{vFIBA2},{vFIBB2}={vFIBB2},{ba}({vFIBA2}+{vFIBB2},65535)")
+        ]
+        return sp(*parts)
 
     def run(self,src:str)->str:
         toks=self.literals(self.rename(tokenize(src)))
