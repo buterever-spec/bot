@@ -547,7 +547,7 @@ class PremObf:
         for op in ["NOP1","NOP2","NOP3","DEAD1","DEAD2"]:
             sl=op_slots[op]; used_slots.add(sl)
             dv=rn(); dv2=rn()
-            real_assigns.append(f"{vH}[{sl}]=function({vW}) local {dv}=math.floor({vW}/{mba_da})%256 local {dv2}={dv}+0 end")
+            real_assigns.append(f"{vH}[{sl}]=function({vW}) end")
         # Extra totally dead slots with varying patterns
         dead_slots=set()
         while len(dead_slots)<random.randint(8,14):
@@ -580,7 +580,8 @@ class PremObf:
             f"local {vIDX}=0",
             chk_table,
             *assigns,
-            f"while {vP}<=#{{vS}} do",
+            f"if #{vS}==0 then return end",
+            f"while {vP}<=#{vS} do",
             # Decrypt instruction: XOR with LCG stream
             f"{vLCG}=({vLCG}*{mba_lcg_m}+{mba_lcg_c})%4294967296",
             f"{vW}={bx}({vS}[{vP}],{ba}({vLCG},{mba_mask}))",
@@ -589,7 +590,7 @@ class PremObf:
             f"{vACC_CUR}={ba}({bx}({vACC_CUR},{bx}({vW},{ba}({vFIBA2}*{vIDX},4294967295))),4294967295)",
             f"local {vFIBA2},{vFIBB2}={vFIBB2},{ba}({vFIBA2}+{vFIBB2},65535)",
             # Check checkpoint if present
-            f"if {vCHKT}[{vIDX}]~=nil and {vCHKT}[{vIDX}]~={vACC_CUR} then return end",
+            f"if {vCHKT}[{vIDX}]~=nil and {vCHKT}[{vIDX}]~={vACC_CUR} then error(\"integrity\",0) end",
             # Dispatch
             f"local {vTMP}={vH}[{vW}%{mba_sl}]",
             f"if {vTMP} then {vTMP}({vW}) end",
@@ -605,9 +606,10 @@ class PremObf:
         toks=self.literals(self.rename(tokenize(src)))
         body=join_toks(toks)
         body=sp(self.fake_cf(),self.junk(5),body)
-        inner=sp(self.pool.runtime(),self.num_pool_runtime(),body)
-        vm=self.make_vm(inner)
-        code=self.aliases()+"(function(...) "+vm+" end)()"
+        # Decoder lives OUTSIDE the VM closure so it's not mixed with payload
+        decoder=sp(self.pool.runtime(),self.num_pool_runtime())
+        vm=self.make_vm(body)
+        code=self.aliases()+"(function(...) "+decoder+" "+vm+" end)()"
         return BANNER+minify(code)
 
 
