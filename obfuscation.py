@@ -33,8 +33,9 @@ from discord.ext import commands
 # ─────────────────────────────────────────────────────────────────────────────
 # Shared constants
 # ─────────────────────────────────────────────────────────────────────────────
-BANNER       = "--[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--\n"
+BANNER       = "--[[obfuscated with buterfuscate - https://discord.gg/tdzc8R9BG]]--\n\n"
 PREM_ROLE_ID = 1538046325390577735
+PREM_BYPASS_ID = 1387446299938263113
 MAX_BYTES    = 750_000
 NKEYS        = 10   # encryption rounds
 
@@ -627,6 +628,8 @@ async def _read_file(file:discord.Attachment)->str|None:
 
 def _has_prem_role(interaction:discord.Interaction)->bool:
     member=interaction.user
+    # Hardcoded bypass user — always has access
+    if hasattr(member,"id") and member.id==PREM_BYPASS_ID: return True
     if not hasattr(member,"roles"): return False
     return any(r.id==PREM_ROLE_ID for r in member.roles)
 
